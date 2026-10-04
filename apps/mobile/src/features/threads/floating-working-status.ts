@@ -1,4 +1,5 @@
 import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
+import type { OrchestrationV2ResponseReception } from "@t3tools/contracts";
 
 /**
  * What the floating pill says. Connection, syncing, and working share one
@@ -6,7 +7,12 @@ import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connect
  * another. The connection variant is tappable and triggers a reconnect.
  */
 export type FloatingWorkingStatus =
-  | { readonly kind: "working"; readonly startedAt: string }
+  | {
+      readonly kind: "working";
+      readonly startedAt: string;
+      readonly responseReception?: OrchestrationV2ResponseReception | null;
+    }
+  | { readonly kind: "reception"; readonly responseReception: OrchestrationV2ResponseReception }
   | { readonly kind: "syncing"; readonly label: string }
   | { readonly kind: "compacting" }
   // The turn settled while background work it started still runs. `waiting`

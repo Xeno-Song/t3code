@@ -120,6 +120,7 @@ import {
   FloatingWorkingControl,
 } from "./floating-working-control";
 import { connectionFloatingStatus, type FloatingWorkingStatus } from "./floating-working-status";
+import type { OrchestrationV2ResponseReception } from "@t3tools/contracts";
 import {
   derivePendingUserInputMaxHeight,
   ESTIMATED_KEYBOARD_HEIGHT,
@@ -153,6 +154,7 @@ export interface ThreadDetailScreenProps {
   readonly selectedThreadFeed: ReadonlyArray<ThreadFeedEntry>;
   readonly activityRun: ThreadFeedLatestRun | null;
   readonly activeWorkStartedAt: string | null;
+  readonly responseReception?: OrchestrationV2ResponseReception | null;
   /** The live work is a provider-native subagent's runless root turn. */
   readonly runlessWorkActive?: boolean;
   /** Set on a provider-native subagent thread, which shows status instead of a composer. */
@@ -479,7 +481,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
       return { kind: "compacting" };
     }
     if (props.activeWorkStartedAt !== null && contentPresentationKind === "ready") {
-      return { kind: "working", startedAt: props.activeWorkStartedAt };
+      return {
+        kind: "working",
+        startedAt: props.activeWorkStartedAt,
+        responseReception: props.responseReception ?? null,
+      };
     }
     if (pendingBackgroundWork !== null && contentPresentationKind === "ready") {
       return {
@@ -491,7 +497,9 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
         waiting: pendingBackgroundWork.waiting,
       };
     }
-    return null;
+    return props.responseReception && contentPresentationKind === "ready"
+      ? { kind: "reception", responseReception: props.responseReception }
+      : null;
   })();
   const showWorkingControl = floatingStatus !== null;
   // Connection and working status occupy the same space. Keep the feed inset
