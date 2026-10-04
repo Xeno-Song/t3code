@@ -20,6 +20,21 @@ const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 
+describe("response reception client setting", () => {
+  it("defaults to off for existing clients", () => {
+    expect(decodeClientSettings({}).responseReceptionIndicatorEnabled).toBe(false);
+  });
+  it.each([true, false])("persists and patches %s", (enabled) => {
+    const input = { responseReceptionIndicatorEnabled: enabled };
+    expect(encodeClientSettings(decodeClientSettings(input))).toMatchObject(input);
+    expect(decodeClientSettingsPatch(input)).toEqual(input);
+  });
+  it("rejects non-boolean settings", () => {
+    expect(() => decodeClientSettings({ responseReceptionIndicatorEnabled: "true" })).toThrow();
+    expect(() => decodeClientSettingsPatch({ responseReceptionIndicatorEnabled: 1 })).toThrow();
+  });
+});
+
 describe("ServerSettings response streaming", () => {
   it("defaults to paragraph buffering", () => {
     expect(decodeServerSettings({}).responseStreamingMode).toBe("paragraph");

@@ -943,6 +943,19 @@ export const OrchestrationV2ProviderTurnTokenUsage = Schema.Struct({
 export type OrchestrationV2ProviderTurnTokenUsage =
   typeof OrchestrationV2ProviderTurnTokenUsage.Type;
 
+export const OrchestrationV2ResponseReception = Schema.Struct({
+  receivedTextBytes: NonNegativeInt,
+  /** Cumulative output tokens reported by the provider; absent/null until reported. */
+  outputTokens: Schema.optional(Schema.NullOr(NonNegativeInt)),
+  /** Time spent waiting on the provider before the current active interval. */
+  providerWaitMs: Schema.optional(Schema.NullOr(NonNegativeInt)),
+  /** Start of the active provider interval; null while a tool is running or after completion. */
+  providerWaitStartedAt: Schema.optional(Schema.NullOr(Schema.String)),
+  firstTextReceivedAt: Schema.optional(Schema.NullOr(Schema.String)),
+  lastTextReceivedAt: Schema.NullOr(Schema.String),
+});
+export type OrchestrationV2ResponseReception = typeof OrchestrationV2ResponseReception.Type;
+
 export const OrchestrationV2ProviderTurn = Schema.Struct({
   id: ProviderTurnId,
   providerThreadId: ProviderThreadId,
@@ -961,6 +974,7 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
+  responseReception: Schema.optional(OrchestrationV2ResponseReception),
   turnTokenUsage: Schema.optional(TurnTokenUsage),
 });
 export type OrchestrationV2ProviderTurn = typeof OrchestrationV2ProviderTurn.Type;

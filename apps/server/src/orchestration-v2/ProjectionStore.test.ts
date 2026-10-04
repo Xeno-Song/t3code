@@ -381,7 +381,7 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
       assert.deepEqual(yield* store.getTurnStartHistory(threadId, [RunId.make("run:other")]), []);
     }),
   );
-  it.effect("preserves stored provider usage when a terminal update omits it", () =>
+  it.effect("preserves stored provider usage and reception when updates omit them", () =>
     Effect.gen(function* () {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
       const now = yield* DateTime.now;
@@ -452,7 +452,18 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
         nodeId,
         driver,
         occurredAt: now,
-        payload: { ...providerTurn, tokenUsage: initialUsage },
+        payload: {
+          ...providerTurn,
+          tokenUsage: initialUsage,
+          responseReception: {
+            receivedTextBytes: 2048,
+            outputTokens: 1000,
+            providerWaitMs: 5000,
+            providerWaitStartedAt: initialUsage.updatedAt,
+            firstTextReceivedAt: "2026-08-28T23:59:58.000Z",
+            lastTextReceivedAt: initialUsage.updatedAt,
+          },
+        },
       });
       yield* projectionStore.apply({
         id: EventId.make("event:provider-usage-reload:completed"),
@@ -466,6 +477,14 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
 
       const reloaded = yield* projectionStore.getThreadProjection(threadId);
       assert.deepEqual(reloaded.providerTurns[0]?.tokenUsage, initialUsage);
+      assert.deepEqual(reloaded.providerTurns[0]?.responseReception, {
+        receivedTextBytes: 2048,
+        outputTokens: 1000,
+        providerWaitMs: 5000,
+        providerWaitStartedAt: initialUsage.updatedAt,
+        firstTextReceivedAt: "2026-08-28T23:59:58.000Z",
+        lastTextReceivedAt: initialUsage.updatedAt,
+      });
       assert.strictEqual(reloaded.providerTurns[0]?.status, "completed");
 
       yield* projectionStore.apply({
@@ -485,6 +504,23 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
 
       const replaced = yield* projectionStore.getThreadProjection(threadId);
       assert.deepEqual(replaced.providerTurns[0]?.tokenUsage, replacementUsage);
+      assert.deepEqual(
+        replaced.providerTurns[0]?.responseReception,
+        reloaded.providerTurns[0]?.responseReception,
+      );
+      const reception = { receivedTextBytes: 0, lastTextReceivedAt: null };
+      yield* projectionStore.apply({
+        id: EventId.make("event:provider-usage-reload:reception"),
+        type: "provider-turn.updated",
+        threadId,
+        nodeId,
+        driver,
+        occurredAt: now,
+        payload: { ...providerTurn, responseReception: reception },
+      });
+      const receptionReplaced = yield* projectionStore.getThreadProjection(threadId);
+      assert.deepEqual(receptionReplaced.providerTurns[0]?.responseReception, reception);
+      assert.deepEqual(receptionReplaced.providerTurns[0]?.tokenUsage, replacementUsage);
     }),
   );
 

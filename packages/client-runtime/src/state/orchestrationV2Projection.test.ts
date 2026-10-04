@@ -122,6 +122,14 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
         maxTokens: 200_000,
         updatedAt: "2026-08-29T00:00:00.000Z",
       },
+      responseReception: {
+        receivedTextBytes: 2048,
+        outputTokens: 1000,
+        providerWaitMs: 5000,
+        providerWaitStartedAt: "2026-08-29T00:00:00.000Z",
+        firstTextReceivedAt: "2026-08-28T23:59:58.000Z",
+        lastTextReceivedAt: "2026-08-29T00:00:00.000Z",
+      },
     };
     const projection = { ...emptyProjection, providerTurns: [running] };
     const event = {
@@ -135,6 +143,7 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
         status: "completed",
         completedAt: now,
         tokenUsage: undefined,
+        responseReception: undefined,
       },
     } as OrchestrationV2DomainEvent;
 
@@ -142,6 +151,14 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
 
     expect(next?.providerTurns[0]?.status).toBe("completed");
     expect(next?.providerTurns[0]?.tokenUsage).toEqual(running.tokenUsage);
+    expect(next?.providerTurns[0]?.responseReception).toEqual(running.responseReception);
+    const replacement = { receivedTextBytes: 0, lastTextReceivedAt: null };
+    const replaced = applyOrchestrationV2ProjectionEvent(next!, {
+      ...event,
+      payload: { ...event.payload, responseReception: replacement },
+    } as OrchestrationV2DomainEvent);
+    expect(replaced?.providerTurns[0]?.responseReception).toEqual(replacement);
+    expect(replaced?.providerTurns[0]?.tokenUsage).toEqual(running.tokenUsage);
   });
 
   it("applies thread lifecycle payloads instead of leaving stale metadata", () => {
