@@ -9,6 +9,10 @@ import {
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 import { normalizeClaudeTurnTokenUsage } from "../../provider/ClaudeTurnTokenUsage.ts";
 import {
+  makeProviderResponseReception,
+  type ProviderResponseReception,
+} from "./ProviderResponseReception.ts";
+import {
   type CanUseTool,
   forkSession as forkClaudeSession,
   type ForkSessionOptions,
@@ -84,6 +88,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Scope from "effect/Scope";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
@@ -2642,6 +2647,13 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
 }
 
 interface ActiveClaudeTurnContext {
+  responseReception?: ProviderResponseReception;
+  readonly responseReceptionBlocks: {
+    readonly streamBlocks: Map<number, string>;
+    readonly nextStreamIndex: Map<string, number>;
+    readonly nextSnapshotIndex: Map<string, number>;
+    readonly snapshots: Set<string>;
+  };
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly nativeTurnId: string;
   nativeMessageCursor: string | null;
@@ -3703,6 +3715,9 @@ export function makeClaudeAdapterV2(
           status: input.status,
           startedAt: input.context.startedAt,
           completedAt: input.completedAt,
+          ...(input.context.responseReception === undefined
+            ? {}
+            : { responseReception: input.context.responseReception.current }),
         });
 
         const buildToolCallArtifacts = (input: {
@@ -4549,6 +4564,7 @@ export function makeClaudeAdapterV2(
           readonly toolInput: ClaudeNativeToolInput;
           readonly parentToolUseId: string | null;
           readonly presentation?: ClaudeToolPresentation | undefined;
+          readonly trackReception?: boolean;
         }) {
           const existing = input.context.toolCalls.get(input.nativeItemId);
           if (existing !== undefined) {
@@ -4609,6 +4625,13 @@ export function makeClaudeAdapterV2(
             ...(input.presentation === undefined ? {} : { presentation: input.presentation }),
           };
           input.context.toolCalls.set(input.nativeItemId, toolCall);
+          if (
+            input.trackReception !== false &&
+            input.parentToolUseId === null &&
+            input.context.responseReception
+          ) {
+            yield* input.context.responseReception.startTool(input.nativeItemId);
+          }
           yield* emitToolCallArtifacts(
             buildToolCallArtifacts({
               context: input.context,
@@ -4786,6 +4809,18 @@ export function makeClaudeAdapterV2(
             }),
         });
 
+        const finishResponseReception = Effect.fnUntraced(function* (
+          context: ActiveClaudeTurnContext,
+          reportedOutputTokens?: number,
+        ) {
+          if (context.responseReception)
+            yield* context.responseReception.finish(reportedOutputTokens);
+          context.responseReceptionBlocks.streamBlocks.clear();
+          context.responseReceptionBlocks.nextStreamIndex.clear();
+          context.responseReceptionBlocks.nextSnapshotIndex.clear();
+          context.responseReceptionBlocks.snapshots.clear();
+        });
+
         const finalizeActiveTurn = Effect.fnUntraced(function* (input: {
           readonly context: ActiveClaudeTurnContext;
           readonly status: Extract<
@@ -4798,6 +4833,19 @@ export function makeClaudeAdapterV2(
           readonly result?: SDKResultMessage;
         }) {
           yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
+          const hasSubagents =
+            input.context.subagentsByTaskId.size > 0 || input.context.subagentsByToolUseId.size > 0;
+          const turnTokenUsage = normalizeClaudeTurnTokenUsage(
+            input.result,
+            hasSubagents,
+            input.status,
+          );
+          // Result usage reconciles partial message reports; child-agent totals
+          // must not replace the root-only reports collected during streaming.
+          yield* finishResponseReception(
+            input.context,
+            hasSubagents ? undefined : turnTokenUsage.outputTokens,
+          );
           for (const toolCall of input.context.toolCalls.values()) {
             const artifacts = buildToolCallArtifacts({
               context: input.context,
@@ -4937,12 +4985,7 @@ export function makeClaudeAdapterV2(
                     status: input.status,
                     completedAt: input.completedAt,
                   }),
-                  turnTokenUsage: normalizeClaudeTurnTokenUsage(
-                    input.result,
-                    input.context.subagentsByTaskId.size > 0 ||
-                      input.context.subagentsByToolUseId.size > 0,
-                    input.status,
-                  ),
+                  turnTokenUsage,
                 },
               }),
               // Surface this native thread's roster before the root turn
@@ -5560,6 +5603,7 @@ export function makeClaudeAdapterV2(
             if (event.type === "message_start") {
               reasoning.messageId = event.message.id;
               reasoning.streamBlocks.clear();
+              context.responseReceptionBlocks.streamBlocks.clear();
             } else if (
               event.type === "content_block_start" &&
               event.content_block.type === "thinking" &&
@@ -5598,7 +5642,77 @@ export function makeClaudeAdapterV2(
                 reasoning.streamBlocks.delete(event.index);
               }
             }
+            if (
+              input.replayed !== true &&
+              reasoning.messageId !== null &&
+              context.responseReception
+            ) {
+              if (event.type === "message_start" || event.type === "message_delta") {
+                const outputTokens =
+                  event.type === "message_start"
+                    ? event.message.usage?.output_tokens
+                    : event.usage.output_tokens;
+                if (outputTokens !== undefined) {
+                  yield* context.responseReception.observeOutputTokens(
+                    reasoning.messageId,
+                    outputTokens,
+                  );
+                }
+              }
+              if (event.type === "content_block_start") {
+                const block = event.content_block;
+                const text =
+                  block.type === "text"
+                    ? block.text
+                    : block.type === "thinking"
+                      ? block.thinking
+                      : "";
+                if (block.type === "text" || block.type === "thinking") {
+                  const blocks = context.responseReceptionBlocks;
+                  const key = `${reasoning.messageId}:${block.type}`;
+                  const index = blocks.nextStreamIndex.get(key) ?? 0;
+                  blocks.nextStreamIndex.set(key, index + 1);
+                  const itemId = `${key}:${index}`;
+                  blocks.streamBlocks.set(event.index, itemId);
+                  yield* context.responseReception.append(itemId, text);
+                }
+              } else if (event.type === "content_block_delta") {
+                const delta = event.delta;
+                const text =
+                  delta.type === "text_delta"
+                    ? delta.text
+                    : delta.type === "thinking_delta"
+                      ? delta.thinking
+                      : "";
+                const itemId = context.responseReceptionBlocks.streamBlocks.get(event.index);
+                if (itemId !== undefined) yield* context.responseReception.append(itemId, text);
+              } else if (event.type === "content_block_stop") {
+                context.responseReceptionBlocks.streamBlocks.delete(event.index);
+              }
+            }
             return;
+          }
+          if (
+            message.type === "assistant" &&
+            !message.parent_tool_use_id &&
+            input.replayed !== true &&
+            context.responseReception
+          ) {
+            const blocks = context.responseReceptionBlocks;
+            if (!blocks.snapshots.has(message.uuid)) {
+              // SDK assistant frames repeat individual completed blocks, not the whole message.
+              blocks.snapshots.add(message.uuid);
+              for (const block of message.message.content) {
+                if (block.type !== "text" && block.type !== "thinking") continue;
+                const key = `${message.message.id}:${block.type}`;
+                const index = blocks.nextSnapshotIndex.get(key) ?? 0;
+                blocks.nextSnapshotIndex.set(key, index + 1);
+                yield* context.responseReception.observeSnapshot(
+                  `${key}:${index}`,
+                  block.type === "text" ? block.text : block.thinking,
+                );
+              }
+            }
           }
           if (
             message.type === "assistant" &&
@@ -5792,6 +5906,12 @@ export function makeClaudeAdapterV2(
             const now = yield* DateTime.now;
             yield* completeProviderRetry(context, now);
             if (message.parent_tool_use_id === null && message.message.usage !== undefined) {
+              if (context.responseReception) {
+                yield* context.responseReception.observeOutputTokens(
+                  message.message.id,
+                  message.message.usage.output_tokens,
+                );
+              }
               yield* emitProviderEvent({
                 type: "provider_turn.updated",
                 driver: CLAUDE_PROVIDER,
@@ -5815,6 +5935,9 @@ export function makeClaudeAdapterV2(
                     context.input.modelSelection,
                     DateTime.formatIso(now),
                   ),
+                  ...(context.responseReception === undefined
+                    ? {}
+                    : { responseReception: context.responseReception.current }),
                 },
               });
             }
@@ -6026,6 +6149,13 @@ export function makeClaudeAdapterV2(
 
           const toolPresentations = claudeToolPresentationsFromAssistantMessage(message);
           for (const toolUse of claudeToolUseBlocksFromAssistantMessage(message)) {
+            if (
+              input.replayed !== true &&
+              parentToolUseIdFromSdkMessage(message) === null &&
+              context.responseReception
+            ) {
+              yield* context.responseReception.startTool(toolUse.id);
+            }
             const nativeToolInput = claudeNativeToolInputFromUnknown(toolUse.input);
             if (toolUse.name === "Agent") {
               rememberClaudeSubagentLaunch(
@@ -6055,6 +6185,7 @@ export function makeClaudeAdapterV2(
                 mcpToolPresentation({
                   toolName: toolUse.name.replace(/^mcp__claude_ai_/u, "mcp__"),
                 }),
+              trackReception: input.replayed !== true,
             });
             const heldPlan = heldProposedPlansByToolUseId.get(toolUse.id);
             if (heldPlan !== undefined) {
@@ -6069,6 +6200,13 @@ export function makeClaudeAdapterV2(
           }
 
           for (const { toolResult, output } of claudeToolResultEntriesFromMessage(message)) {
+            if (
+              input.replayed !== true &&
+              parentToolUseIdFromSdkMessage(message) === null &&
+              context.responseReception
+            ) {
+              yield* context.responseReception.endTool(toolResult.tool_use_id);
+            }
             const subagent = context.subagentsByToolUseId.get(toolResult.tool_use_id);
             // A resume task_started reuses the resuming tool call's
             // tool_use_id (e.g. SendMessage), whose tool_result only
@@ -6101,6 +6239,7 @@ export function makeClaudeAdapterV2(
                 toolName: toolNameFromClaudeToolResult(toolResult),
                 toolInput: EMPTY_CLAUDE_NATIVE_TOOL_INPUT,
                 parentToolUseId,
+                trackReception: false,
               }));
             const completedAt = yield* DateTime.now;
             const toolNonExecutionKind = claudeToolNonExecutionKind(
@@ -7138,6 +7277,12 @@ export function makeClaudeAdapterV2(
             });
             yield* rememberProviderThread(turnInput.providerThread);
             const context: ActiveClaudeTurnContext = {
+              responseReceptionBlocks: {
+                streamBlocks: new Map(),
+                nextStreamIndex: new Map(),
+                nextSnapshotIndex: new Map(),
+                snapshots: new Set(),
+              },
               input: turnInput,
               nativeTurnId,
               nativeMessageCursor: null,
@@ -7195,6 +7340,19 @@ export function makeClaudeAdapterV2(
                   uuid: claudePromptUuid(turnInput.attemptId),
                 });
             const querySession = yield* openQuery(turnInput, nativeThreadId);
+            context.responseReception = yield* makeProviderResponseReception({
+              startedAt: context.startedAt,
+              emit: (responseReception) =>
+                emitProviderEvent({
+                  type: "provider_turn.updated",
+                  driver: CLAUDE_PROVIDER,
+                  threadId: context.input.threadId,
+                  providerTurn: {
+                    ...providerTurnPayload({ context, status: "running", completedAt: null }),
+                    responseReception,
+                  },
+                }),
+            }).pipe(Effect.provideService(Scope.Scope, sessionScope));
             yield* Ref.set(activeTurn, context);
             yield* emitProviderEvent({
               type: "provider_turn.updated",
@@ -7275,6 +7433,14 @@ export function makeClaudeAdapterV2(
           },
           (effect, turnInput) =>
             effect.pipe(
+              Effect.onError(() =>
+                Effect.gen(function* () {
+                  const context = yield* Ref.get(activeTurn);
+                  if (context?.input.attemptId === turnInput.attemptId) {
+                    yield* finishResponseReception(context);
+                  }
+                }),
+              ),
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterTurnStartError({
@@ -7425,6 +7591,8 @@ export function makeClaudeAdapterV2(
         );
 
         const closeSession = Effect.fnUntraced(function* () {
+          const turn = yield* Ref.get(activeTurn);
+          if (turn !== null) yield* finishResponseReception(turn);
           const existing = yield* Ref.get(queryContext);
           if (existing !== null) {
             yield* existing.query.close.pipe(Effect.ignore);
