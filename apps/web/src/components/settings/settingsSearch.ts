@@ -305,6 +305,14 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["hide fold running monitoring threads inbox sidebar shelf"],
   },
   {
+    id: "response-reception",
+    title: "Response reception",
+    to: "/settings/general",
+    searchTerms: [
+      "working streaming received text output tokens average tps speed last response activity progress beta",
+    ],
+  },
+  {
     id: "auto-settle-inactive-threads",
     title: "Auto-settle inactive threads",
     to: "/settings/general",
