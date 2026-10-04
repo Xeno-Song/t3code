@@ -2,6 +2,10 @@ import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "../ContextHandoffBudget.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
+  makeProviderResponseReception,
+  type ProviderResponseReception,
+} from "./ProviderResponseReception.ts";
+import {
   mcpToolPresentation,
   type McpToolPresentation,
 } from "../../provider/CodexToolPresentation.ts";
@@ -1015,6 +1019,7 @@ function codexErrorInfoCode(value: unknown): string | null {
 }
 
 interface ActiveCodexTurnContext {
+  responseReception?: ProviderResponseReception;
   latestProviderFailure?: {
     readonly nativeMessage: string;
     readonly failure: OrchestrationV2ProviderFailure;
@@ -1783,6 +1788,31 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               startedAt: input.startedAt,
               itemPositions: new Map(),
             };
+            context.responseReception = yield* makeProviderResponseReception({
+              startedAt: context.startedAt,
+              emit: (responseReception) =>
+                emitProviderEvent({
+                  type: "provider_turn.updated",
+                  driver: CODEX_PROVIDER,
+                  threadId: context.projectionThreadId,
+                  providerTurn: {
+                    id: context.providerTurnId,
+                    providerThreadId: context.providerThread.id,
+                    nodeId: context.providerNodeId,
+                    runAttemptId: context.input.attemptId,
+                    nativeTurnRef: {
+                      driver: CODEX_PROVIDER,
+                      nativeId: context.nativeTurnId,
+                      strength: "strong",
+                    },
+                    ordinal: context.providerTurnOrdinal,
+                    status: "running",
+                    startedAt: context.startedAt,
+                    completedAt: null,
+                    responseReception,
+                  },
+                }),
+            }).pipe(Effect.provideService(Scope.Scope, scope));
             yield* Ref.update(limitedTurnItems, (current) => {
               const next = new Map(current);
               next.delete(context.providerThread.id);
@@ -1812,6 +1842,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 status: "running",
                 startedAt: input.startedAt,
                 completedAt: null,
+                responseReception: context.responseReception.current,
               },
             });
             return context;
@@ -2991,6 +3022,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           if (context === undefined || payload.delta.length === 0) return;
           yield* completeProviderRetry(context, yield* DateTime.now);
           const itemId = reasoningPartKey(payload.turnId, payload.itemId, stream, index);
+          if (context.responseReception) {
+            yield* context.responseReception.append(itemId, payload.delta);
+          }
           // Reserve the position before the delayed flush, ahead of later tool items.
           yield* resolveItemOrdinal(context, itemId);
           yield* reasoningDeltas.append({ turnId: payload.turnId, itemId, delta: payload.delta });
@@ -2999,6 +3033,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           turnId: string,
           item: { id: string; summary?: ReadonlyArray<string>; content?: ReadonlyArray<string> },
         ) {
+          const context = yield* awaitActiveTurn(turnId);
           for (const stream of ["summary", "content"] as const) {
             for (const [index] of (item[stream] ?? []).entries()) {
               reasoningPartKey(turnId, item.id, stream, index);
@@ -3007,6 +3042,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           for (const [key, part] of reasoningParts) {
             if (part.turnId !== turnId || part.nativeItemId !== item.id) continue;
             const finalText = item[part.stream]?.[part.index];
+            if (finalText && context?.responseReception) {
+              yield* context.responseReception.observeSnapshot(key, finalText);
+            }
             yield* reasoningDeltas.complete({
               turnId,
               itemId: key,
@@ -3721,6 +3759,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             const context = (yield* Ref.get(activeTurns)).get(payload.turnId);
             if (context !== undefined) {
               yield* completeProviderRetry(context, yield* DateTime.now);
+              if (context.responseReception) {
+                yield* context.responseReception.append(payload.itemId, payload.delta);
+              }
             }
             yield* agentMessageDeltas.append({
               turnId: payload.turnId,
@@ -3850,6 +3891,13 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             if (context === undefined) {
               return;
             }
+            const usageState = usageStateForThread(payload.threadId);
+            if (context.responseReception && usageState.activeTurnId === payload.turnId) {
+              yield* context.responseReception.observeOutputTokens(
+                payload.turnId,
+                getCodexTurnAccumulator(usageState, payload.turnId).outputTokens,
+              );
+            }
             const now = yield* DateTime.now;
             // Live context usage rides on the provider turn (#8144): the turn
             // is the natural owner and re-emitting it never disturbs items.
@@ -3875,6 +3923,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                   payload.tokenUsage,
                   DateTime.formatIso(now),
                 ),
+                ...(context.responseReception === undefined
+                  ? {}
+                  : { responseReception: context.responseReception.current }),
               },
             });
           }).pipe(Effect.orDie),
@@ -4047,6 +4098,21 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               return;
             }
 
+            if (
+              context.responseReception &&
+              (!("status" in payload.item) ||
+                !["completed", "failed", "declined"].includes(payload.item.status)) &&
+              (payload.item.type === "commandExecution" ||
+                payload.item.type === "mcpToolCall" ||
+                payload.item.type === "dynamicToolCall" ||
+                payload.item.type === "webSearch" ||
+                payload.item.type === "fileChange" ||
+                payload.item.type === "collabAgentToolCall" ||
+                payload.item.type === "imageGeneration")
+            ) {
+              yield* context.responseReception.startTool(payload.item.id);
+            }
+
             if (payload.item.type === "contextCompaction") {
               yield* emitCompactionItem(
                 context,
@@ -4168,6 +4234,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
 
         yield* client.handleServerNotification("item/completed", (payload) =>
           Effect.gen(function* () {
+            const timingContext = (yield* Ref.get(activeTurns)).get(payload.turnId);
+            if (timingContext?.responseReception) {
+              yield* timingContext.responseReception.endTool(payload.item.id);
+            }
             if (payload.item.type === "contextCompaction")
               // The notification callback runs on the input reader. Let it read
               // the injection response while the session-scoped request waits.
@@ -4449,6 +4519,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               itemId: payload.item.id,
               finalText: payload.item.text,
             });
+            if (context.responseReception) {
+              yield* context.responseReception.observeSnapshot(payload.item.id, text);
+            }
             yield* Ref.update(finalAnswerItemIdsByTurn, (current) => {
               const itemIds = current.get(payload.turnId);
               if (itemIds === undefined || !itemIds.has(payload.item.id)) {
@@ -5141,6 +5214,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               for (const [key, part] of reasoningParts) {
                 if (part.turnId === input.nativeTurnId) reasoningParts.delete(key);
               }
+              const responseReception = input.context.responseReception
+                ? yield* input.context.responseReception.finish()
+                : undefined;
               yield* emitProviderEvent({
                 type: "provider_turn.updated",
                 driver: CODEX_PROVIDER,
@@ -5160,6 +5236,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                   status: input.status,
                   startedAt: input.context.startedAt,
                   completedAt: input.completedAt,
+                  ...(responseReception === undefined ? {} : { responseReception }),
                   turnTokenUsage: completeCodexTurnTokenUsage(
                     usageStateForThread(
                       input.context.providerThread.nativeThreadRef?.nativeId ??
