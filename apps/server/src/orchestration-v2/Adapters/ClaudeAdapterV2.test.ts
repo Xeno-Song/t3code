@@ -2428,6 +2428,71 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   );
 
   it.effect(
+    "excludes parallel Claude tool executions and ignores child-tool frames in provider timing",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("tool-timing"),
+            text: "Read two files.",
+            attachments: [],
+          }),
+        );
+        const toolUse = (id: string, parent: string | null = null) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid: `tool-${id}`,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: parent,
+            message: {
+              id: `message-${id}`,
+              model: "claude-sonnet-4-6",
+              content: [{ type: "tool_use", id, name: "Read", input: { file_path: "file.ts" } }],
+            },
+          });
+        const toolResult = (id: string) =>
+          claudeSdkFrame({
+            type: "user",
+            uuid: `result-${id}`,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: id, content: "Done" }],
+            },
+          });
+        yield* TestClock.adjust("3 seconds");
+        yield* harness.offerAndWait(toolUse("first"));
+        yield* TestClock.adjust("2 seconds");
+        yield* harness.offerAndWait(toolUse("second"));
+        yield* TestClock.adjust("3 seconds");
+        yield* harness.offerAndWait(toolResult("first"));
+        const paused = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (paused?.type !== "provider_turn.updated") throw new Error("Missing paused timing");
+        assert.equal(paused.providerTurn.responseReception?.providerWaitMs, 3000);
+        assert.isNull(paused.providerTurn.responseReception?.providerWaitStartedAt);
+        yield* TestClock.adjust("2 seconds");
+        yield* harness.offerAndWait(toolResult("second"));
+        yield* harness.offerAndWait(toolUse("child", "child-tool"));
+        yield* TestClock.adjust("4 seconds");
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "timing-result", result: "Done" }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated")
+          throw new Error("Missing final provider timing");
+        assert.equal(final.providerTurn.responseReception?.providerWaitMs, 7000);
+        assert.isNull(final.providerTurn.responseReception?.providerWaitStartedAt);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect(
     "uses Claude message output usage, deduplicating stream and snapshot reports and excluding children",
     () =>
       Effect.gen(function* () {
