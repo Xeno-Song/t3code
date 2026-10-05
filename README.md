@@ -89,6 +89,7 @@ We are (mostly) not accepting contributions yet. Small fixes may be considered. 
 Full docs live in [docs/](./docs). There's no docs site yet.
 
 - [Install and first run](./docs/user/install.md)
+- [Linux에서 fork 빌드·실행과 Bash alias](./docs/user/linux-source-build.md)
 - [Permission modes](./docs/user/permission-modes.md)
 - [Keyboard shortcuts](./docs/user/keybindings.md)
 - [Project settings](./docs/user/project-settings.md)
