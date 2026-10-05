@@ -43,6 +43,23 @@ in a new thread's model picker to add or remove them. A regular click returns to
 single model. Choose a base branch and send. Each selection starts a separate thread
 and worktree while you stay in the new thread composer. This requires a Git project.
 
+## See whether a response is arriving
+
+Enable **Response reception** in **Settings → General** on web or desktop, or
+**Settings → Thread behavior → Beta** on mobile. The setting is off by default
+and applies to that client. During Codex and Claude work, it shows provider-reported output
+tokens and average tokens per second (TPS), for example `[ ↓ 1.5k ( 23.4 tps) ]`.
+Output tokens include reasoning and tool arguments as counted by the provider;
+input tokens and child-agent usage reports are excluded. The count updates when
+the provider reports usage, which may happen after a response rather than during
+each streamed chunk. Until then, the count is `—`.
+Average TPS divides reported output tokens by all time spent waiting for the
+provider, including the wait before the first text and between responses, while
+excluding tool execution. Overlapping tools are excluded once. TPS recalculates
+every second while waiting for the provider and pauses while tools run. It resets
+for each new task. TPS is `—` until token usage and timing are available. Older servers and other
+providers hide the indicator.
+
 ## Pin and reorder threads
 
 Pin a thread from its menu to keep it above your active work.

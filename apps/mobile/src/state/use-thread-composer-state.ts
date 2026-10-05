@@ -2,6 +2,7 @@ import type { ComposerTextPaste } from "../native/T3ComposerEditor.types";
 import { useAtomValue } from "@effect/atom-react";
 import { threadRuntimeIsActive } from "@t3tools/client-runtime/state/shell";
 import {
+  deriveResponseReception,
   deriveProviderSubagentStatus,
   deriveRunlessWorkStartedAt,
   deriveThreadActivityRun,
@@ -415,6 +416,16 @@ export function useThreadComposerState() {
     );
   }, [selectedThreadActivityRun, runlessWorkStartedAt, selectedThreadRuntime, selectedThreadShell]);
   const runlessWorkActive = runlessWorkStartedAt !== null;
+  const responseReceptionIndicatorEnabled =
+    AsyncResult.isSuccess(preferencesResult) &&
+    preferencesResult.value.responseReceptionIndicatorEnabled === true;
+  const responseReception = useMemo(
+    () =>
+      responseReceptionIndicatorEnabled && selectedThreadProjection
+        ? deriveResponseReception(selectedThreadProjection.projection)
+        : null,
+    [responseReceptionIndicatorEnabled, selectedThreadProjection],
+  );
 
   const providerSubagentStatus = useMemo(
     () =>
@@ -1049,6 +1060,7 @@ export function useThreadComposerState() {
     selectedThreadQueuedMessages,
     dispatchingQueuedMessageId,
     activeWorkStartedAt,
+    responseReception,
     runlessWorkActive,
     providerSubagentStatus,
     isCompacting,

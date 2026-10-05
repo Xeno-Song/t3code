@@ -4,6 +4,8 @@ import {
   MessageId,
   ProviderInstanceId,
   ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   ProviderSessionId,
   ProviderDriverKind,
   RunId,
@@ -17,6 +19,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { v2Projection } from "./orchestrationV2TestFixtures.ts";
 import {
+  deriveResponseReception,
+  formatResponseReception,
   presentPendingBackgroundWork,
   deriveReportedModelSelection,
   deriveLatestThreadRun,
@@ -51,6 +55,388 @@ function run(id: string, ordinal: number, status: OrchestrationV2RunStatus) {
     contextHandoffId: null,
   };
 }
+
+describe("response reception presentation", () => {
+  const active = { ...run("active", 2, "running"), rootNodeId: NodeId.make("root-active") };
+  const receivedAt = "2026-07-28T10:00:00.000Z";
+  const turn = (
+    nodeId: string,
+    bytes?: number,
+    lastTextReceivedAt: string | null = receivedAt,
+    outputTokens: number | null = bytes ?? null,
+    firstTextReceivedAt: string | null = lastTextReceivedAt === null ? null : receivedAt,
+  ) => ({
+    id: ProviderTurnId.make(`turn-${nodeId}`),
+    providerThreadId: ProviderThreadId.make("provider-thread"),
+    nodeId: NodeId.make(nodeId),
+    runAttemptId: null,
+    nativeTurnRef: null,
+    ordinal: 1,
+    status: "running" as const,
+    startedAt: now,
+    completedAt: null,
+    ...(bytes === undefined
+      ? {}
+      : {
+          responseReception: {
+            receivedTextBytes: bytes,
+            outputTokens,
+            firstTextReceivedAt,
+            lastTextReceivedAt,
+          },
+        }),
+  });
+
+  it("sums roots of this run across attempts and excludes children and older runs", () => {
+    const attempts = [
+      {
+        id: RunAttemptId.make("attempt"),
+        runId: active.id,
+        attemptOrdinal: 1,
+        rootNodeId: NodeId.make("root-first"),
+        providerInstanceId: active.providerInstanceId,
+        providerThreadId: ProviderThreadId.make("provider-thread"),
+        providerTurnId: null,
+        reason: "initial" as const,
+        status: "completed" as const,
+        startedAt: now,
+        completedAt: now,
+      },
+    ];
+    const projection = {
+      ...v2Projection,
+      runs: [run("old", 1, "completed"), active, run("queued", 3, "queued")],
+      attempts,
+      providerTurns: [
+        turn("root-first", 1024, receivedAt, 120, "2026-07-28T09:59:58.000Z"),
+        turn("root-active", 2048, "2026-07-28T10:00:01.000Z", 80),
+        turn("child", 99999),
+        turn("old", 99999),
+      ],
+    };
+    expect(deriveResponseReception(projection)).toEqual({
+      receivedTextBytes: 3072,
+      outputTokens: 200,
+      providerWaitMs: null,
+      providerWaitStartedAt: null,
+      firstTextReceivedAt: "2026-07-28T09:59:58.000Z",
+      lastTextReceivedAt: "2026-07-28T10:00:01.000Z",
+    });
+    expect(
+      deriveResponseReception({ ...projection, runs: [{ ...active, status: "completed" }] }),
+    ).toMatchObject({ receivedTextBytes: 3072, outputTokens: 200 });
+    expect(
+      deriveResponseReception({
+        ...projection,
+        runs: [{ ...active, rootNodeId: NodeId.make("new-root") }],
+        attempts: [],
+        providerTurns: [...projection.providerTurns, turn("new-root", 0, null, null)],
+      }),
+    ).toEqual({
+      receivedTextBytes: 0,
+      outputTokens: null,
+      providerWaitMs: null,
+      providerWaitStartedAt: null,
+      firstTextReceivedAt: null,
+      lastTextReceivedAt: null,
+    });
+  });
+
+  it("hides unsupported providers and old server data", () => {
+    expect(
+      deriveResponseReception({
+        ...v2Projection,
+        runs: [active],
+        providerTurns: [turn("root-active")],
+      }),
+    ).toBeNull();
+    expect(
+      deriveResponseReception({
+        ...v2Projection,
+        providerTurns: [turn("root-active", 1024)],
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps timing unavailable when an older root has no first reception time", () => {
+    const old = turn("root-active", 12, receivedAt, 100);
+    expect(
+      deriveResponseReception({
+        ...v2Projection,
+        runs: [active],
+        providerTurns: [
+          {
+            ...old,
+            responseReception: {
+              receivedTextBytes: 12,
+              outputTokens: 100,
+              lastTextReceivedAt: receivedAt,
+            },
+          },
+        ],
+      }),
+    ).toEqual({
+      receivedTextBytes: 12,
+      outputTokens: 100,
+      providerWaitMs: null,
+      providerWaitStartedAt: null,
+      firstTextReceivedAt: null,
+      lastTextReceivedAt: receivedAt,
+    });
+  });
+
+  const reception = {
+    receivedTextBytes: 12,
+    outputTokens: 1500,
+    providerWaitMs: 64000,
+    providerWaitStartedAt: null,
+    lastTextReceivedAt: receivedAt,
+  };
+
+  it.each(["completed", "interrupted", "failed", "cancelled"] as const)(
+    "retains the final totals and frozen TPS after a %s turn while requests stay queued",
+    (status) => {
+      const finished = { ...active, status, completedAt: now };
+      const first = {
+        ...turn("root-active", 6, receivedAt, 120),
+        status: "completed" as const,
+        responseReception: { ...reception, outputTokens: 120, providerWaitMs: 10000 },
+      };
+      const second = {
+        ...first,
+        id: ProviderTurnId.make("second-iteration"),
+        responseReception: { ...reception, outputTokens: 80, providerWaitMs: 2000 },
+      };
+      const projection = {
+        ...v2Projection,
+        runs: [
+          finished,
+          run("queued", 3, "queued"),
+          { ...run("held", 4, "queued"), queueHeld: true },
+          { ...run("cancelled-before-start", 5, "cancelled"), startedAt: null },
+        ],
+        providerTurns: [first, second, turn("old", 99999), turn("child", 99999)],
+      };
+      const final = deriveResponseReception(projection)!;
+      expect(final).toMatchObject({
+        outputTokens: 200,
+        providerWaitMs: 12000,
+        providerWaitStartedAt: null,
+      });
+      expect(formatResponseReception(final, Date.parse(receivedAt) + 1000)).toBe(
+        "[ ↓ 200 ( 16.7 tps) ]",
+      );
+      expect(formatResponseReception(final, Date.parse(receivedAt) + 60000)).toBe(
+        "[ ↓ 200 ( 16.7 tps) ]",
+      );
+      expect(
+        deriveResponseReception({
+          ...projection,
+          providerTurns: [
+            { ...first, responseReception: { ...first.responseReception, outputTokens: 150 } },
+            second,
+          ],
+        })?.outputTokens,
+      ).toBe(230);
+    },
+  );
+
+  it.each(["preparing", "starting", "running"] as const)(
+    "clears the previous turn when the next turn is %s, even before it reports usage",
+    (status) => {
+      const next = { ...run("next", 3, status), rootNodeId: NodeId.make("next-root") };
+      const oldTurn = turn("root-active", 12, receivedAt, 1500);
+      const projection = {
+        ...v2Projection,
+        runs: [{ ...active, status: "completed" as const }, next],
+        providerTurns: [oldTurn],
+      };
+      expect(deriveResponseReception(projection)).toBeNull();
+      expect(
+        deriveResponseReception({
+          ...projection,
+          providerTurns: [oldTurn, turn("next-root", 0, null, 0)],
+        })?.outputTokens,
+      ).toBe(0);
+      expect(
+        deriveResponseReception({
+          ...projection,
+          providerTurns: [oldTurn, turn("next-root", 3, receivedAt, 5)],
+        })?.outputTokens,
+      ).toBe(5);
+      expect(
+        deriveResponseReception({
+          ...projection,
+          runs: [projection.runs[0]!, { ...next, status: "completed" as const }],
+        }),
+      ).toBeNull();
+    },
+  );
+
+  it("retains a provider-native subagent's final reception until its next runless root starts", () => {
+    const root: OrchestrationV2ExecutionNode = {
+      id: NodeId.make("child-root"),
+      threadId: v2Projection.thread.id,
+      runId: null,
+      parentNodeId: null,
+      rootNodeId: NodeId.make("child-root"),
+      kind: "root_turn",
+      status: "completed",
+      countsForRun: false,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      runtimeRequestId: null,
+      checkpointScopeId: null,
+      startedAt: now,
+      completedAt: now,
+    };
+    const projection = {
+      ...v2Projection,
+      thread: {
+        ...v2Projection.thread,
+        creationSource: "provider" as const,
+        lineage: {
+          parentThreadId: ThreadId.make("parent"),
+          relationshipToParent: "subagent" as const,
+          rootThreadId: ThreadId.make("parent"),
+        },
+      },
+      nodes: [root],
+      providerTurns: [turn("child-root", 12, receivedAt, 100)],
+    };
+    expect(deriveResponseReception(projection)?.outputTokens).toBe(100);
+    expect(
+      deriveResponseReception({
+        ...projection,
+        nodes: [
+          root,
+          {
+            ...root,
+            id: NodeId.make("next-root"),
+            rootNodeId: NodeId.make("next-root"),
+            status: "running",
+            completedAt: null,
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it.each([
+    [{ ...reception }, "[ ↓ 1.5k ( 23.4 tps) ]"],
+    [{ ...reception, outputTokens: null }, "[ ↓ — ( — tps) ]"],
+    [{ ...reception, outputTokens: 0 }, "[ ↓ 0 ( 0.0 tps) ]"],
+    [{ ...reception, outputTokens: 999 }, "[ ↓ 999 ( 15.6 tps) ]"],
+    [{ ...reception, outputTokens: 1000 }, "[ ↓ 1k ( 15.6 tps) ]"],
+    [{ ...reception, outputTokens: 12500 }, "[ ↓ 12.5k ( 195.3 tps) ]"],
+    [{ ...reception, outputTokens: 1500000 }, "[ ↓ 1.5m ( 23437.5 tps) ]"],
+    [{ ...reception, receivedTextBytes: 1048576 }, "[ ↓ 1.5k ( 23.4 tps) ]"],
+    [{ ...reception, providerWaitMs: null }, "[ ↓ 1.5k ( — tps) ]"],
+    [{ ...reception, providerWaitMs: 0 }, "[ ↓ 1.5k ( — tps) ]"],
+    [{ ...reception, providerWaitStartedAt: "invalid" }, "[ ↓ 1.5k ( — tps) ]"],
+  ])("formats actual output tokens in the compact bracket display", (value, expected) => {
+    expect(formatResponseReception(value, Date.parse(receivedAt))).toBe(expected);
+  });
+
+  it("recalculates TPS during provider waiting even without new text or usage reports", () => {
+    const activeReception = {
+      ...reception,
+      providerWaitMs: 2000,
+      providerWaitStartedAt: receivedAt,
+    };
+    expect(formatResponseReception(activeReception, Date.parse(receivedAt) + 3000)).toBe(
+      "[ ↓ 1.5k ( 300.0 tps) ]",
+    );
+    expect(formatResponseReception(activeReception, Date.parse(receivedAt) + 8000)).toBe(
+      "[ ↓ 1.5k ( 150.0 tps) ]",
+    );
+  });
+
+  it("pauses TPS during tool execution and after completion", () => {
+    expect(formatResponseReception(reception, Date.parse(receivedAt) + 3000)).toBe(
+      "[ ↓ 1.5k ( 23.4 tps) ]",
+    );
+    expect(formatResponseReception(reception, Date.parse(receivedAt) + 60000)).toBe(
+      "[ ↓ 1.5k ( 23.4 tps) ]",
+    );
+  });
+
+  it("clamps active wait duration when the remote server clock is ahead", () => {
+    expect(
+      formatResponseReception(
+        { ...reception, providerWaitMs: 5000, providerWaitStartedAt: receivedAt },
+        Date.parse(receivedAt) - 1000,
+      ),
+    ).toBe("[ ↓ 1.5k ( 300.0 tps) ]");
+  });
+
+  it("uses provider waiting before the first text rather than the text reception interval", () => {
+    expect(
+      formatResponseReception(
+        {
+          ...reception,
+          providerWaitMs: 10000,
+          firstTextReceivedAt: receivedAt,
+          lastTextReceivedAt: receivedAt,
+        },
+        Date.parse(receivedAt),
+      ),
+    ).toBe("[ ↓ 1.5k ( 150.0 tps) ]");
+  });
+
+  it("aggregates completed provider intervals and the current interval across root turns", () => {
+    const previous = turn("root-active", 100, receivedAt, 120);
+    const current = {
+      ...turn("root-active", 200, receivedAt, 80),
+      id: ProviderTurnId.make("second-provider-turn"),
+    };
+    const result = deriveResponseReception({
+      ...v2Projection,
+      runs: [active],
+      providerTurns: [
+        {
+          ...previous,
+          status: "completed",
+          responseReception: {
+            ...previous.responseReception!,
+            providerWaitMs: 10000,
+            providerWaitStartedAt: null,
+          },
+        },
+        {
+          ...current,
+          responseReception: {
+            ...current.responseReception!,
+            providerWaitMs: 2000,
+            providerWaitStartedAt: receivedAt,
+          },
+        },
+        turn("child", 99999),
+      ],
+    });
+    expect(result).toMatchObject({
+      outputTokens: 200,
+      providerWaitMs: 12000,
+      providerWaitStartedAt: receivedAt,
+    });
+    expect(formatResponseReception(result!, Date.parse(receivedAt) + 3000)).toBe(
+      "[ ↓ 200 ( 13.3 tps) ]",
+    );
+  });
+
+  it("keeps TPS unavailable when a root has legacy metadata without tool timing", () => {
+    const result = deriveResponseReception({
+      ...v2Projection,
+      runs: [active],
+      providerTurns: [turn("root-active", 12, receivedAt, 100)],
+    });
+    expect(result?.providerWaitMs).toBeNull();
+    expect(formatResponseReception(result!, Date.parse(receivedAt) + 3000)).toBe(
+      "[ ↓ 100 ( — tps) ]",
+    );
+  });
+});
 
 describe("thread execution presentation", () => {
   it("derives the current root failure without inheriting errors from children or previous runs", () => {

@@ -37,6 +37,16 @@ afterEach(() => {
 });
 
 describe("client settings hydration", () => {
+  it.each([true, false])("saves response reception=%s on this client", async (enabled) => {
+    expect(getClientSettings().responseReceptionIndicatorEnabled).toBe(false);
+    await persistClientSettingsPatch({ responseReceptionIndicatorEnabled: enabled });
+    expect(getClientSettings().responseReceptionIndicatorEnabled).toBe(enabled);
+    expect(persistenceMocks.setClientSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        responseReceptionIndicatorEnabled: enabled,
+      }),
+    );
+  });
   const savedSettings = {
     ...DEFAULT_CLIENT_SETTINGS,
     timestampFormat: "12-hour" as const,

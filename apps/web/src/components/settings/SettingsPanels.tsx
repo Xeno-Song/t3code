@@ -618,6 +618,10 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.contextWindowMeterEnabled !== DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled
         ? ["Context window indicator"]
         : []),
+      ...(settings.responseReceptionIndicatorEnabled !==
+      DEFAULT_UNIFIED_SETTINGS.responseReceptionIndicatorEnabled
+        ? ["Response reception"]
+        : []),
       ...(settings.responseStreamingMode !== DEFAULT_UNIFIED_SETTINGS.responseStreamingMode
         ? ["Response streaming"]
         : []),
@@ -688,6 +692,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.proactivePanelsEnabled,
       settings.environmentIdentificationMode,
       settings.contextWindowMeterEnabled,
+      settings.responseReceptionIndicatorEnabled,
       settings.fontFamilyCode,
       settings.fontFamilyComposer,
       settings.fontFamilySans,
@@ -802,6 +807,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       sendShortcut: DEFAULT_UNIFIED_SETTINGS.sendShortcut,
       followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
       contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
+      responseReceptionIndicatorEnabled: DEFAULT_UNIFIED_SETTINGS.responseReceptionIndicatorEnabled,
       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
       panelAnimationDurationMs: DEFAULT_UNIFIED_SETTINGS.panelAnimationDurationMs,
@@ -2386,6 +2392,28 @@ export function GeneralSettingsPanel() {
                 updateSettings({ sidebarWorkingShelfEnabled: Boolean(checked) })
               }
               aria-label="Working section (beta)"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("response-reception")}
+          description="Show output tokens and live average TPS beside Working, excluding tool execution time."
+          resetAction={
+            settings.responseReceptionIndicatorEnabled ? (
+              <SettingResetButton
+                label="response reception"
+                onClick={() => updateSettings({ responseReceptionIndicatorEnabled: false })}
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.responseReceptionIndicatorEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ responseReceptionIndicatorEnabled: Boolean(checked) })
+              }
+              aria-label="Response reception"
             />
           }
         />

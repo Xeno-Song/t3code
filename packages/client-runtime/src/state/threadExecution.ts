@@ -13,6 +13,7 @@ import {
   type ServerProviderModel,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2ResponseReception,
   orchestrationV2RunWorkStartedAt,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -118,6 +119,118 @@ export function deriveRunlessWorkStartedAt(
   const status = deriveProviderSubagentStatus(projection);
   return status !== null && isOrchestrationV2WorkActive(status.status) ? status.startedAt : null;
 }
+
+/** Root reception for the current turn, retained until the next turn starts. */
+export function deriveResponseReception(
+  projection: OrchestrationV2ThreadProjection,
+): OrchestrationV2ResponseReception | null {
+  const run =
+    latestMatchingRun(projection, (candidate) => ACTIVITY_RUN_STATUSES.has(candidate.status)) ??
+    latestMatchingRun(
+      projection,
+      (candidate) =>
+        candidate.startedAt !== null &&
+        candidate.status !== "queued" &&
+        candidate.status !== "rolled_back",
+    );
+  const roots = new Set(
+    run === null
+      ? []
+      : projection.attempts
+          .filter((attempt) => attempt.runId === run.id)
+          .map((attempt) => attempt.rootNodeId),
+  );
+  if (run?.rootNodeId) roots.add(run.rootNodeId);
+  if (run === null && isProviderNativeSubagentThread(projection.thread)) {
+    const root = projection.nodes.findLast(
+      (node) => node.kind === "root_turn" && node.runId === null,
+    );
+    if (root) roots.add(root.id);
+  }
+  let supported = false;
+  let receivedTextBytes = 0;
+  let outputTokens: number | null = null;
+  let firstTextReceivedAt: string | null = null;
+  let incompleteTiming = false;
+  let lastTextReceivedAt: string | null = null;
+  let providerWaitMs = 0;
+  let providerWaitStartedAt: string | null = null;
+  let completeProviderTiming = true;
+  let activeProviderIntervals = 0;
+  for (const turn of projection.providerTurns) {
+    if (!roots.has(turn.nodeId)) continue;
+    const received = turn.responseReception;
+    if (received === undefined) continue;
+    supported = true;
+    if (received.providerWaitMs == null || received.providerWaitStartedAt === undefined) {
+      completeProviderTiming = false;
+    } else {
+      providerWaitMs += received.providerWaitMs;
+      if (received.providerWaitStartedAt !== null) {
+        providerWaitStartedAt = received.providerWaitStartedAt;
+        activeProviderIntervals++;
+      }
+    }
+    receivedTextBytes += received.receivedTextBytes;
+    if (received.outputTokens != null) {
+      outputTokens = (outputTokens ?? 0) + received.outputTokens;
+    }
+    if (received.receivedTextBytes > 0 && received.firstTextReceivedAt == null) {
+      incompleteTiming = true;
+    }
+    if (
+      received.firstTextReceivedAt != null &&
+      (firstTextReceivedAt === null || received.firstTextReceivedAt < firstTextReceivedAt)
+    ) {
+      firstTextReceivedAt = received.firstTextReceivedAt;
+    }
+    if (
+      received.lastTextReceivedAt !== null &&
+      (lastTextReceivedAt === null || received.lastTextReceivedAt > lastTextReceivedAt)
+    ) {
+      lastTextReceivedAt = received.lastTextReceivedAt;
+    }
+  }
+  return supported
+    ? {
+        receivedTextBytes,
+        outputTokens,
+        providerWaitMs:
+          completeProviderTiming && activeProviderIntervals <= 1 ? providerWaitMs : null,
+        providerWaitStartedAt:
+          completeProviderTiming && activeProviderIntervals <= 1 ? providerWaitStartedAt : null,
+        firstTextReceivedAt: incompleteTiming ? null : firstTextReceivedAt,
+        lastTextReceivedAt,
+      }
+    : null;
+}
+
+export function formatResponseReception(
+  reception: OrchestrationV2ResponseReception,
+  nowMs: number,
+): string {
+  const tokens =
+    reception.outputTokens == null
+      ? "—"
+      : responseTokenFormat.format(reception.outputTokens).toLowerCase();
+  const waitStartedAtMs = Date.parse(reception.providerWaitStartedAt ?? "");
+  const activeWaitMs = Number.isFinite(waitStartedAtMs) ? Math.max(0, nowMs - waitStartedAtMs) : 0;
+  const providerSeconds =
+    reception.providerWaitMs == null ? null : (reception.providerWaitMs + activeWaitMs) / 1000;
+  const tps =
+    reception.outputTokens != null &&
+    providerSeconds !== null &&
+    providerSeconds > 0 &&
+    (reception.providerWaitStartedAt === null || Number.isFinite(waitStartedAtMs))
+      ? (reception.outputTokens / providerSeconds).toFixed(1)
+      : "—";
+  return `[ ↓ ${tokens} ( ${tps} tps) ]`;
+}
+
+const responseTokenFormat = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
 
 export interface ProviderSubagentStatus {
   readonly status: OrchestrationV2ExecutionNode["status"];

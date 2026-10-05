@@ -28,6 +28,7 @@ import {
   OrchestrationV2LimitRecoveryUpdate,
   OrchestrationV2DomainEvent,
   OrchestrationV2ProviderCapabilities,
+  OrchestrationV2ProviderTurn,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
   OrchestrationV2RpcSchemas,
@@ -42,6 +43,72 @@ import {
 } from "./orchestrationV2.ts";
 
 const now = DateTime.makeUnsafe("2026-04-20T00:00:00.000Z");
+
+describe("provider response reception contract", () => {
+  const base = {
+    id: "turn",
+    providerThreadId: "provider-thread",
+    nodeId: "root",
+    runAttemptId: null,
+    nativeTurnRef: null,
+    ordinal: 1,
+    status: "running",
+    startedAt: null,
+    completedAt: null,
+  };
+  const decode = Schema.decodeUnknownSync(OrchestrationV2ProviderTurn);
+  const encode = Schema.encodeSync(OrchestrationV2ProviderTurn);
+  it("accepts old turns without reception metadata", () => {
+    expect(encode(decode(base))).toEqual(base);
+  });
+  it.each([
+    { receivedTextBytes: 0, lastTextReceivedAt: null },
+    { receivedTextBytes: 2458, lastTextReceivedAt: "2026-10-04T00:00:00.000Z" },
+    {
+      receivedTextBytes: 2458,
+      outputTokens: 1000,
+      providerWaitMs: 5000,
+      providerWaitStartedAt: "2026-10-04T00:00:00.000Z",
+      firstTextReceivedAt: "2026-10-03T23:59:58.000Z",
+      lastTextReceivedAt: "2026-10-04T00:00:00.000Z",
+    },
+    {
+      receivedTextBytes: 0,
+      outputTokens: null,
+      firstTextReceivedAt: null,
+      lastTextReceivedAt: null,
+    },
+    { receivedTextBytes: 0, outputTokens: 0, firstTextReceivedAt: null, lastTextReceivedAt: null },
+  ])("round-trips reception metadata over the wire", (responseReception) => {
+    expect(encode(decode({ ...base, responseReception }))).toEqual({ ...base, responseReception });
+  });
+  it.each([-1, 1.5])("rejects invalid received byte counts", (receivedTextBytes) => {
+    expect(() =>
+      decode({ ...base, responseReception: { receivedTextBytes, lastTextReceivedAt: null } }),
+    ).toThrow();
+  });
+  it.each([-1, 1.5])("rejects invalid reported output counts", (outputTokens) => {
+    expect(() =>
+      decode({
+        ...base,
+        responseReception: { receivedTextBytes: 0, outputTokens, lastTextReceivedAt: null },
+      }),
+    ).toThrow();
+  });
+  it.each([-1, 1.5])("rejects invalid provider wait durations", (providerWaitMs) => {
+    expect(() =>
+      decode({
+        ...base,
+        responseReception: {
+          receivedTextBytes: 0,
+          providerWaitMs,
+          providerWaitStartedAt: null,
+          lastTextReceivedAt: null,
+        },
+      }),
+    ).toThrow();
+  });
+});
 const LegacyShellStreamItem = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("synchronized") }),
   Schema.Struct({

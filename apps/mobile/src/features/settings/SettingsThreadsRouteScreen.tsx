@@ -249,6 +249,9 @@ function BetaSettingsSection() {
   const preferences = useAtomValue(mobilePreferencesAtom);
   const workingShelfEnabled =
     AsyncResult.isSuccess(preferences) && preferences.value.workingShelfEnabled === true;
+  const responseReceptionIndicatorEnabled =
+    AsyncResult.isSuccess(preferences) &&
+    preferences.value.responseReceptionIndicatorEnabled === true;
 
   return (
     <View className="gap-3">
@@ -259,11 +262,21 @@ function BetaSettingsSection() {
           value={workingShelfEnabled}
           onValueChange={(value) => savePreferences({ workingShelfEnabled: value })}
         />
+        <SettingsSwitchRow
+          icon="arrow.down.circle"
+          label="Response reception"
+          value={responseReceptionIndicatorEnabled}
+          onValueChange={(value) => savePreferences({ responseReceptionIndicatorEnabled: value })}
+        />
       </SettingsSection>
       <Text className="px-2 text-sm text-foreground-muted">
         Fold working and monitoring threads into a Working section. They return to the top of the
         list when they need you. While this is on, active threads are ordered by time and cannot be
         moved.
+      </Text>
+      <Text className="px-2 text-sm text-foreground-muted">
+        Response reception shows output tokens and live average TPS beside Working, excluding tool
+        execution time.
       </Text>
     </View>
   );

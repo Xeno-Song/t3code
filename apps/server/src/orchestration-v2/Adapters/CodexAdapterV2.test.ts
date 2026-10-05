@@ -1986,6 +1986,47 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
+  it.effect("does not start response reception when Codex rejects turn start", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "reception-start-rejected";
+      const prompt = "Start";
+      const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt });
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "reception-start-rejected",
+          entries: [
+            ...preamble.slice(0, 6),
+            {
+              type: "emit_inbound",
+              label: "turn/start-rejected",
+              frame: { id: 3, error: { code: -32600, message: "Cannot start turn" } },
+            },
+          ],
+        }),
+      );
+      const result = yield* harness.runtime
+        .startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("reception-start-rejected"),
+            text: prompt,
+          }),
+        )
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      yield* TestClock.adjust("2 seconds");
+      assert.isFalse(
+        harness.events.some(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.responseReception !== undefined,
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
   it.effect("waits for native start before interrupting an acknowledged queued turn", () =>
     Effect.gen(function* () {
       const nativeThreadId = "early-stop-thread";
@@ -2286,6 +2327,380 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       (event): event is Extract<ProviderAdapterV2Event, { type: "message.updated" }> =>
         event.type === "message.updated" && event.message.role === "assistant",
     );
+
+  it.effect("excludes Codex tool execution from provider wait timing", () =>
+    Effect.gen(function* () {
+      const startMs = 1782622440000;
+      yield* TestClock.setTime(startMs);
+      const nativeThreadId = "tool-timing-thread";
+      const nativeTurnId = "tool-timing-turn";
+      const toolStarted = yield* Deferred.make<void>();
+      const toolCompleted = yield* Deferred.make<void>();
+      const item = {
+        type: "commandExecution",
+        id: "timed-command",
+        command: "pwd",
+        cwd: "/workspace",
+        processId: "42",
+        source: "unifiedExecStartup",
+        commandActions: [{ type: "unknown", command: "pwd" }],
+        aggregatedOutput: null,
+        exitCode: null,
+        durationMs: null,
+      };
+      const transcript = makeCodexReplayTranscript({
+        scenario: "tool-timing",
+        entries: [
+          ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Check the directory." }),
+          {
+            type: "emit_inbound",
+            afterMs: 3000,
+            frame: {
+              method: "item/started",
+              params: {
+                threadId: nativeThreadId,
+                turnId: nativeTurnId,
+                startedAtMs: startMs + 3000,
+                item: { ...item, status: "inProgress" },
+              },
+            },
+          },
+          {
+            type: "emit_inbound",
+            afterMs: 10000,
+            frame: {
+              method: "item/completed",
+              params: {
+                threadId: nativeThreadId,
+                turnId: nativeTurnId,
+                item: {
+                  ...item,
+                  status: "completed",
+                  aggregatedOutput: "/workspace",
+                  exitCode: 0,
+                  durationMs: 10000,
+                },
+              },
+            },
+          },
+          {
+            type: "emit_inbound",
+            afterMs: 2000,
+            frame: {
+              method: "turn/completed",
+              params: {
+                threadId: nativeThreadId,
+                turn: {
+                  ...makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                  completedAt: (startMs + 15000) / 1000,
+                },
+              },
+            },
+          },
+        ],
+      });
+      const harness = yield* makeCodexReplayHarness(transcript, (event) =>
+        Effect.gen(function* () {
+          if (
+            event.type !== "node.updated" ||
+            event.node.nativeItemRef?.nativeId !== "timed-command"
+          )
+            return;
+          if (event.node.status === "running") yield* Deferred.succeed(toolStarted, undefined);
+          if (event.node.status === "completed") yield* Deferred.succeed(toolCompleted, undefined);
+        }),
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("tool-timing-attempt"),
+          text: "Check the directory.",
+        }),
+      );
+      yield* TestClock.adjust("3 seconds");
+      yield* Deferred.await(toolStarted);
+      yield* TestClock.adjust("10 seconds");
+      yield* Deferred.await(toolCompleted);
+      yield* TestClock.adjust("2 seconds");
+      yield* harness.firstTerminal;
+      const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+      if (final?.type !== "provider_turn.updated") throw new Error("Missing final provider timing");
+      assert.equal(final.providerTurn.responseReception?.providerWaitMs, 5000);
+      assert.isNull(final.providerTurn.responseReception?.providerWaitStartedAt);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect("excludes image generation tools with provider-specific status strings", () =>
+    Effect.gen(function* () {
+      const startMs = 1782622440000;
+      yield* TestClock.setTime(startMs);
+      const nativeThreadId = "image-timing-thread";
+      const nativeTurnId = "image-timing-turn";
+      const paused = yield* Deferred.make<void>();
+      const resumed = yield* Deferred.make<void>();
+      const item = { type: "imageGeneration", id: "image-tool", result: "" };
+      const transcript = makeCodexReplayTranscript({
+        scenario: "image-timing",
+        entries: [
+          ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Draw an image." }),
+          {
+            type: "emit_inbound",
+            afterMs: 3000,
+            frame: {
+              method: "item/started",
+              params: {
+                threadId: nativeThreadId,
+                turnId: nativeTurnId,
+                startedAtMs: startMs + 3000,
+                item: { ...item, status: "in_progress" },
+              },
+            },
+          },
+          {
+            type: "emit_inbound",
+            afterMs: 10000,
+            frame: {
+              method: "item/completed",
+              params: {
+                threadId: nativeThreadId,
+                turnId: nativeTurnId,
+                item: { ...item, status: "completed" },
+              },
+            },
+          },
+          {
+            type: "emit_inbound",
+            afterMs: 2000,
+            frame: {
+              method: "turn/completed",
+              params: {
+                threadId: nativeThreadId,
+                turn: {
+                  ...makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                  completedAt: (startMs + 15000) / 1000,
+                },
+              },
+            },
+          },
+        ],
+      });
+      const harness = yield* makeCodexReplayHarness(transcript, (event) =>
+        Effect.gen(function* () {
+          if (event.type !== "provider_turn.updated" || event.providerTurn.status !== "running")
+            return;
+          const timing = event.providerTurn.responseReception;
+          if (timing?.providerWaitMs !== 3000) return;
+          if (timing.providerWaitStartedAt === null) yield* Deferred.succeed(paused, undefined);
+          else yield* Deferred.succeed(resumed, undefined);
+        }),
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("image-timing"),
+          text: "Draw an image.",
+        }),
+      );
+      yield* TestClock.adjust("3 seconds");
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(paused);
+      yield* TestClock.adjust("9 seconds");
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(resumed);
+      yield* TestClock.adjust("1 second");
+      yield* harness.firstTerminal;
+      const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+      if (final?.type !== "provider_turn.updated") throw new Error("Missing final provider timing");
+      assert.equal(final.providerTurn.responseReception?.providerWaitMs, 5000);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect("reports cumulative Codex output usage instead of the last response or text size", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const nativeThreadId = "output-usage-thread";
+        const nativeTurnId = "output-usage-turn";
+        const breakdown = (outputTokens: number) => ({
+          totalTokens: 100 + outputTokens,
+          inputTokens: 100,
+          cachedInputTokens: 0,
+          outputTokens,
+          reasoningOutputTokens: 0,
+        });
+        const transcript = makeCodexReplayTranscript({
+          scenario: "output-usage",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Report usage." }),
+            ...[
+              { total: 105, last: 5 },
+              { total: 105, last: 5 },
+              { total: 115, last: 10 },
+            ].map((report, index) => ({
+              type: "emit_inbound" as const,
+              label: `usage-${index}`,
+              frame: {
+                method: "thread/tokenUsage/updated",
+                params: {
+                  threadId: nativeThreadId,
+                  turnId: nativeTurnId,
+                  tokenUsage: {
+                    total: breakdown(report.total),
+                    last: breakdown(report.last),
+                    modelContextWindow: 200_000,
+                  },
+                },
+              },
+            })),
+            {
+              type: "emit_inbound",
+              label: "complete",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(transcript);
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("output-usage-attempt"),
+            text: "Report usage.",
+          }),
+        );
+        yield* harness.firstTerminal;
+        const reports = harness.events.flatMap((event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.tokenUsage !== undefined
+            ? [event.providerTurn]
+            : [],
+        );
+        assert.deepEqual(
+          reports.map((turn) => turn.responseReception?.outputTokens),
+          [5, 5, 15],
+        );
+        assert.equal(reports[2]?.tokenUsage?.outputTokens, 10);
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final output usage");
+        assert.equal(final.providerTurn.responseReception?.outputTokens, 15);
+        assert.equal(final.providerTurn.responseReception?.receivedTextBytes, 0);
+        assert.equal(final.providerTurn.turnTokenUsage?.outputTokens, 15);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect.each(["preserved", "reset"] as const)(
+    "keeps response reception across mid-turn Codex compaction with %s usage counters",
+    (counters) =>
+      Effect.gen(function* () {
+        const nativeThreadId = `reception-compaction-${counters}`;
+        const nativeTurnId = "reception-compaction-turn";
+        const notify = (method: string, params: Record<string, unknown>) => ({
+          type: "emit_inbound" as const,
+          label: method,
+          frame: { method, params: { threadId: nativeThreadId, turnId: nativeTurnId, ...params } },
+        });
+        const breakdown = (inputTokens: number, outputTokens: number) => ({
+          totalTokens: inputTokens + outputTokens,
+          inputTokens,
+          cachedInputTokens: 0,
+          outputTokens,
+          reasoningOutputTokens: 0,
+        });
+        const report = (total: ReturnType<typeof breakdown>, last: ReturnType<typeof breakdown>) =>
+          notify("thread/tokenUsage/updated", {
+            tokenUsage: { total, last, modelContextWindow: 200_000 },
+          });
+        const message = (id: string, text: string) => {
+          const item = { type: "agentMessage", id, text, phase: "commentary" };
+          return [
+            notify("item/started", { item: { ...item, text: "" }, startedAtMs: 1782622440500 }),
+            notify("item/agentMessage/delta", { itemId: id, delta: text }),
+            notify("item/completed", { item }),
+            notify("item/completed", { item }),
+          ];
+        };
+        const before = report(breakdown(100, 20), breakdown(100, 20));
+        const compactedTotal = counters === "reset" ? breakdown(50, 5) : breakdown(150, 25);
+        const after = report(
+          counters === "reset" ? breakdown(70, 8) : breakdown(170, 28),
+          breakdown(20, 3),
+        );
+        const item = { type: "contextCompaction", id: "compact-reception" };
+        const transcript = makeCodexReplayTranscript({
+          scenario: nativeThreadId,
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue working." }),
+            ...message("before-compaction", "before"),
+            before,
+            before,
+            notify("item/started", { item, startedAtMs: 1782622441000 }),
+            report(compactedTotal, breakdown(50, 5)),
+            // Context recomputation changes `last` without adding billable usage.
+            report(compactedTotal, { ...breakdown(0, 0), totalTokens: 30 }),
+            notify("item/completed", { item }),
+            ...message("after-compaction", "new"),
+            after,
+            after,
+            {
+              type: "emit_inbound",
+              label: "turn/completed",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(transcript);
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make(nativeThreadId),
+            text: "Continue working.",
+          }),
+        );
+        yield* harness.firstTerminal;
+        const reports = harness.events.flatMap((event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.tokenUsage !== undefined
+            ? [event.providerTurn]
+            : [],
+        );
+        assert.deepEqual(
+          reports.map((turn) => turn.responseReception?.outputTokens),
+          [20, 20, 25, 25, 28, 28],
+        );
+        assert.equal(reports[3]?.tokenUsage?.usedTokens, 30);
+        const compactions = harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "compaction"
+            ? [event.turnItem.status]
+            : [],
+        );
+        assert.deepEqual(compactions, ["running", "completed"]);
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final reception");
+        assert.include(final.providerTurn.responseReception, {
+          receivedTextBytes: 9,
+          outputTokens: 28,
+          providerWaitStartedAt: null,
+        });
+        assert.equal(final.providerTurn.turnTokenUsage?.outputTokens, 28);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
 
   it.effect("keeps an asynchronous Codex question actionable after the turn completes", () =>
     Effect.scoped(
@@ -3129,7 +3544,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
-  it.effect.each(["completed", "interrupted"] as const)(
+  it.effect.each(["completed", "interrupted", "failed"] as const)(
     "retains Codex reasoning parts when the turn is %s",
     (terminalStatus) =>
       Effect.scoped(
@@ -3268,7 +3683,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 ]
               : ["Summary one", "Summary two", "Raw trace"],
           );
-          assert.isTrue([...latest.values()].every((item) => item.status === terminalStatus));
+          assert.isTrue(
+            [...latest.values()].every(
+              (item) =>
+                item.status === (terminalStatus === "failed" ? "interrupted" : terminalStatus),
+            ),
+          );
           assert.isTrue([...latest.values()].every((item) => item.streaming === false));
           assert.isTrue(
             [...latest.values()].every(
@@ -3289,6 +3709,26 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             );
           }
           assert.deepEqual(assistantMessages(harness.events), []);
+          const initial = harness.events.find((event) => event.type === "provider_turn.updated");
+          if (initial?.type !== "provider_turn.updated")
+            throw new Error("Missing initial provider turn");
+          assert.include(initial.providerTurn.responseReception, {
+            receivedTextBytes: 0,
+            outputTokens: null,
+            firstTextReceivedAt: null,
+            lastTextReceivedAt: null,
+          });
+          const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+          if (final?.type !== "provider_turn.updated")
+            throw new Error("Missing final provider turn");
+          assert.equal(final.providerTurn.status, terminalStatus);
+          assert.equal(
+            final.providerTurn.responseReception?.receivedTextBytes,
+            Buffer.byteLength([...latest.values()].map((item) => item.text).join(""), "utf8"),
+          );
+          const count = harness.events.length;
+          yield* TestClock.adjust("2 seconds");
+          assert.equal(harness.events.length, count);
         }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
       ),
   );
@@ -3392,6 +3832,32 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ],
     });
   };
+
+  it.effect("counts UTF-8 assistant deltas and snapshots once per item", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeCodexReplayHarness(
+          finalAnswerTranscript("codex-reception", [
+            { id: "streamed", text: "안녕하세요🙂", streamed: true },
+            { id: "snapshot", text: "Second" },
+          ]),
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-reception"),
+            text: "Reply with the requested recovery marker.",
+          }),
+        );
+        yield* harness.firstTerminal;
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final reception");
+        assert.equal(final.providerTurn.responseReception?.receivedTextBytes, 25);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
 
   it.effect("suppresses a trailing empty final answer after a non-empty final answer", () =>
     Effect.scoped(

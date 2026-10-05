@@ -43,6 +43,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { TestClock } from "effect/testing";
 import { Tool } from "effect/unstable/ai";
 import { formatClaudeResumeCompactionQuestion } from "@t3tools/shared/claudeCompaction";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -2073,6 +2074,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
 
   const makeWakeHarnessWithOptions = (options?: {
+    readonly offer?: ClaudeAdapterV2.ClaudeAgentSdkQuerySession["offer"];
     readonly close?: (sdkMessages: Queue.Queue<SDKMessage>) => Effect.Effect<void>;
     readonly interrupt?: Effect.Effect<void>;
     readonly environment?: NodeJS.ProcessEnv;
@@ -2139,7 +2141,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 offer: (message) =>
                   Effect.sync(() => {
                     offeredMessages.push(message);
-                  }),
+                  }).pipe(Effect.andThen(options?.offer?.(message) ?? Effect.void)),
                 setModel: () => Effect.void,
                 setPermissionMode: (mode) =>
                   Effect.sync(() => {
@@ -2314,6 +2316,55 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
+  it.effect("stops response reception after a turn fails to start", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarnessWithOptions({
+        offer: () =>
+          Effect.fail(
+            new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+              method: "offer",
+              cause: "test failure",
+            }),
+          ),
+      });
+      const started = yield* harness.runtime
+        .startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("reception-start-failed"),
+            text: "Start",
+            attachments: [],
+          }),
+        )
+        .pipe(Effect.result);
+      assert.equal(started._tag, "Failure");
+      yield* harness.offerAndWait(makeAssistantTextFrame({ uuid: "late-text", text: "Late text" }));
+      yield* TestClock.adjust("2 seconds");
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({ uuid: "failed-start-result", result: "" }),
+      );
+      yield* Queue.take(harness.terminalReceipts);
+      const turns = harness.events.flatMap((event) =>
+        event.type === "provider_turn.updated" ? [event.providerTurn] : [],
+      );
+      const receptions = turns.flatMap((turn) =>
+        turn.responseReception === undefined ? [] : [turn.responseReception],
+      );
+      assert.isNotEmpty(receptions);
+      for (const reception of receptions) {
+        assert.include(reception, {
+          receivedTextBytes: 0,
+          outputTokens: null,
+          firstTextReceivedAt: null,
+          lastTextReceivedAt: null,
+        });
+      }
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
   it.effect(
     "reuses a background shell's query for omitted and explicit Normal, but blocks Fast",
     () =>
@@ -2374,6 +2425,396 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isTrue(yield* harness.hasPendingBackgroundWork);
         }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
       ),
+  );
+
+  it.effect(
+    "excludes parallel Claude tool executions and ignores child-tool frames in provider timing",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("tool-timing"),
+            text: "Read two files.",
+            attachments: [],
+          }),
+        );
+        const toolUse = (id: string, parent: string | null = null) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid: `tool-${id}`,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: parent,
+            message: {
+              id: `message-${id}`,
+              model: "claude-sonnet-4-6",
+              content: [{ type: "tool_use", id, name: "Read", input: { file_path: "file.ts" } }],
+            },
+          });
+        const toolResult = (id: string) =>
+          claudeSdkFrame({
+            type: "user",
+            uuid: `result-${id}`,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: id, content: "Done" }],
+            },
+          });
+        yield* TestClock.adjust("3 seconds");
+        yield* harness.offerAndWait(toolUse("first"));
+        yield* TestClock.adjust("2 seconds");
+        yield* harness.offerAndWait(toolUse("second"));
+        yield* TestClock.adjust("3 seconds");
+        yield* harness.offerAndWait(toolResult("first"));
+        const paused = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (paused?.type !== "provider_turn.updated") throw new Error("Missing paused timing");
+        assert.equal(paused.providerTurn.responseReception?.providerWaitMs, 3000);
+        assert.isNull(paused.providerTurn.responseReception?.providerWaitStartedAt);
+        yield* TestClock.adjust("2 seconds");
+        yield* harness.offerAndWait(toolResult("second"));
+        yield* harness.offerAndWait(toolUse("child", "child-tool"));
+        yield* TestClock.adjust("4 seconds");
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "timing-result", result: "Done" }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated")
+          throw new Error("Missing final provider timing");
+        assert.equal(final.providerTurn.responseReception?.providerWaitMs, 7000);
+        assert.isNull(final.providerTurn.responseReception?.providerWaitStartedAt);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect(
+    "uses Claude message output usage, deduplicating stream and snapshot reports and excluding children",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("output-usage"),
+            text: "Report usage.",
+            attachments: [],
+          }),
+        );
+        const stream = (event: unknown) =>
+          claudeSdkFrame({
+            type: "stream_event",
+            event,
+            parent_tool_use_id: null,
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "usage-stream",
+          });
+        const snapshot = (
+          id: string,
+          uuid: string,
+          outputTokens: number,
+          parent: string | null = null,
+        ) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: parent,
+            message: {
+              id,
+              model: "claude-sonnet-4-6",
+              content: [{ type: "text", text: "Some output" }],
+              usage: { input_tokens: 100, output_tokens: outputTokens },
+            },
+          });
+        const first = snapshot("usage-first", "usage-snapshot", 7);
+        yield* Queue.offerAll(harness.sdkMessages, [
+          stream({
+            type: "message_start",
+            message: { id: "usage-first", usage: { input_tokens: 100, output_tokens: 0 } },
+          }),
+          stream({
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "Some output" },
+          }),
+          stream({
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 7 },
+          }),
+          first,
+          first,
+          snapshot("usage-first", "usage-revised", 10),
+          snapshot("usage-second", "usage-second-snapshot", 20),
+          snapshot("usage-child", "usage-child-snapshot", 900, "child-tool"),
+          claudeSdkFrame({
+            ...makeResultFrame({ uuid: "usage-result", result: "Done" }),
+            usage: { input_tokens: 200, output_tokens: 42 },
+          }),
+        ]);
+        yield* Queue.take(harness.terminalReceipts);
+        const reports = harness.events.flatMap((event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.tokenUsage !== undefined
+            ? [event.providerTurn]
+            : [],
+        );
+        assert.deepEqual(
+          reports.map((turn) => turn.responseReception?.outputTokens),
+          [7, 7, 10, 30],
+        );
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final output usage");
+        assert.equal(final.providerTurn.responseReception?.outputTokens, 42);
+        assert.equal(final.providerTurn.turnTokenUsage?.outputTokens, 42);
+        assert.isNotNull(final.providerTurn.responseReception?.firstTextReceivedAt);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect(
+    "keeps response reception and provider wait time across mid-turn Claude compaction",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const startedAt = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: startedAt,
+            attemptId: RunAttemptId.make("reception-compaction"),
+            text: "Continue working.",
+            attachments: [],
+          }),
+        );
+        const messageFrames = (id: string, text: string, outputTokens: number) => {
+          const stream = (event: unknown) =>
+            claudeSdkFrame({
+              type: "stream_event",
+              event,
+              parent_tool_use_id: null,
+              session_id: WAKE_NATIVE_SESSION,
+              uuid: `stream-${id}`,
+            });
+          const snapshot = claudeSdkFrame({
+            type: "assistant",
+            uuid: `snapshot-${id}`,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id,
+              model: "claude-sonnet-4-6",
+              content: [{ type: "text", text }],
+              usage: { input_tokens: 100, output_tokens: outputTokens },
+            },
+          });
+          return [
+            stream({ type: "message_start", message: { id, usage: { output_tokens: 0 } } }),
+            stream({
+              type: "content_block_start",
+              index: 0,
+              content_block: { type: "text", text: "" },
+            }),
+            stream({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }),
+            stream({ type: "content_block_stop", index: 0 }),
+            stream({
+              type: "message_delta",
+              delta: { stop_reason: "end_turn" },
+              usage: { output_tokens: outputTokens },
+            }),
+            snapshot,
+            snapshot,
+          ];
+        };
+        yield* TestClock.adjust("3 seconds");
+        const firstTextReceivedAt = DateTime.formatIso(yield* DateTime.now);
+        for (const frame of messageFrames("before-compaction", "before", 20)) {
+          yield* harness.offerAndWait(frame);
+        }
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "compact_boundary",
+            compact_metadata: { trigger: "auto", pre_tokens: 1500, post_tokens: 200 },
+            uuid: "reception-compact-boundary",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        yield* TestClock.adjust("5 seconds");
+        const lastTextReceivedAt = DateTime.formatIso(yield* DateTime.now);
+        for (const frame of messageFrames("after-compaction", "new", 3)) {
+          yield* harness.offerAndWait(frame);
+        }
+        yield* TestClock.adjust("2 seconds");
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            ...makeResultFrame({ uuid: "reception-compaction-result", result: "new", numTurns: 2 }),
+            usage: { input_tokens: 200, output_tokens: 23 },
+          }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const reports = harness.events.flatMap((event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.tokenUsage !== undefined &&
+          event.providerTurn.responseReception !== undefined
+            ? [event.providerTurn.responseReception.outputTokens]
+            : [],
+        );
+        assert.deepEqual(reports, [20, 20, 23, 23]);
+        const compaction = harness.events.find(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
+        );
+        assert.isDefined(compaction);
+        const watermark = harness.events.find(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.tokenUsage?.usedTokens === 200,
+        );
+        assert.isDefined(watermark);
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final reception");
+        assert.include(final.providerTurn.responseReception, {
+          receivedTextBytes: 9,
+          outputTokens: 23,
+          providerWaitMs: 10000,
+          providerWaitStartedAt: null,
+          firstTextReceivedAt,
+          lastTextReceivedAt,
+        });
+        assert.equal(final.providerTurn.turnTokenUsage?.outputTokens, 23);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect.each(["completed", "interrupted", "failed"] as const)(
+    "counts root text and thinking blocks once when %s and resets the next turn",
+    (status) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const start = (attempt: string) =>
+          harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: DateTime.makeUnsafe("2026-10-04T00:00:00.000Z"),
+              attemptId: RunAttemptId.make(attempt),
+              text: "Input must not count",
+              attachments: [],
+            }),
+          );
+        yield* start(`reception-${status}`);
+        const stream = (event: unknown, parent: string | null = null) =>
+          claudeSdkFrame({
+            type: "stream_event",
+            event,
+            parent_tool_use_id: parent,
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "stream",
+          });
+        const snapshot = (uuid: string, content: unknown, parent: string | null = null) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: parent,
+            message: { id: "message-reception", model: "claude-sonnet-4-6", content },
+          });
+        const first = snapshot("text-first", [{ type: "text", text: "안녕하세요" }]);
+        yield* Queue.offerAll(harness.sdkMessages, [
+          stream({ type: "message_start", message: { id: "message-reception" } }),
+          stream({
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "안" },
+          }),
+          stream({ type: "content_block_stop", index: 0 }),
+          first,
+          first,
+          stream({
+            type: "content_block_start",
+            index: 1,
+            content_block: { type: "tool_use", id: "tool", name: "Read", input: {} },
+          }),
+          stream({
+            type: "content_block_delta",
+            index: 1,
+            delta: { type: "input_json_delta", partial_json: '{"path":"ignored"}' },
+          }),
+          stream({
+            type: "content_block_start",
+            index: 2,
+            content_block: { type: "text", text: "" },
+          }),
+          stream({
+            type: "content_block_delta",
+            index: 2,
+            delta: { type: "text_delta", text: "🙂" },
+          }),
+          stream({ type: "content_block_stop", index: 2 }),
+          snapshot("text-second", [{ type: "text", text: "🙂" }]),
+          stream({
+            type: "content_block_start",
+            index: 3,
+            content_block: { type: "thinking", thinking: "추론" },
+          }),
+          stream({ type: "content_block_stop", index: 3 }),
+          snapshot("thinking", [{ type: "thinking", thinking: "추론", signature: "ignored" }]),
+          stream({ type: "message_start", message: { id: "child" } }, "child-tool"),
+          stream(
+            {
+              type: "content_block_start",
+              index: 0,
+              content_block: { type: "text", text: "Child output" },
+            },
+            "child-tool",
+          ),
+          snapshot("child", [{ type: "text", text: "Child output" }], "child-tool"),
+          makeResultFrame({
+            uuid: `result-${status}`,
+            result: "안녕하세요🙂",
+            ...(status === "completed"
+              ? {}
+              : {
+                  terminalReason:
+                    status === "failed" ? ("api_error" as const) : ("aborted_streaming" as const),
+                }),
+          }),
+        ]);
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, status);
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final reception");
+        assert.equal(final.providerTurn.responseReception?.receivedTextBytes, 25);
+        assert.equal(final.providerTurn.responseReception?.outputTokens, 1);
+        const count = harness.events.length;
+        yield* TestClock.adjust("2 seconds");
+        assert.equal(harness.events.length, count);
+        if (status !== "completed") return;
+        yield* start("reception-next");
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "next-result", result: "" }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const initial = harness.events.find(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.runAttemptId === RunAttemptId.make("reception-next"),
+        );
+        if (initial?.type !== "provider_turn.updated") throw new Error("Missing next reception");
+        assert.include(initial.providerTurn.responseReception, {
+          receivedTextBytes: 0,
+          outputTokens: null,
+          firstTextReceivedAt: null,
+          lastTextReceivedAt: null,
+        });
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
   it.effect.each(["completed", "interrupted"] as const)(
@@ -2491,6 +2932,24 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           ),
         );
         for (const item of latest.values()) assert.notInclude(item.text, "secret-signature");
+        const initial = harness.events.find((event) => event.type === "provider_turn.updated");
+        if (initial?.type !== "provider_turn.updated")
+          throw new Error("Missing initial provider turn");
+        assert.include(initial.providerTurn.responseReception, {
+          receivedTextBytes: 0,
+          outputTokens: null,
+          firstTextReceivedAt: null,
+          lastTextReceivedAt: null,
+        });
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final provider turn");
+        assert.equal(
+          final.providerTurn.responseReception?.receivedTextBytes,
+          Buffer.byteLength([...latest.values()].map((item) => item.text).join(""), "utf8"),
+        );
+        const count = harness.events.length;
+        yield* TestClock.adjust("2 seconds");
+        assert.equal(harness.events.length, count);
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
@@ -2753,7 +3212,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   it.effect("names an expired Claude login instead of the terminal API error", () =>
     Effect.gen(function* () {
       const configDir = "/synthetic/Claude config";
-      const cwd = "/synthetic/project";
+      const cwd = (yield* Path.Path).resolve("/synthetic/project");
       const harness = yield* makeWakeHarnessWithOptions({
         environment: { CLAUDE_CONFIG_DIR: configDir },
       });
@@ -2790,7 +3249,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       if (terminal.status !== "failed") return;
       assert.include(terminal.failure.message, "run `claude auth login`");
       assert.include(terminal.failure.message, configDir);
-      assert.include(terminal.failure.message, cwd);
+      assert.include(terminal.failure.message, encodeJsonString(cwd));
       assert.notInclude(terminal.failure.message, "repeated API errors");
     }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );

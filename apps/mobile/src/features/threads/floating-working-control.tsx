@@ -1,4 +1,6 @@
 import type { SubagentPillSegment } from "@t3tools/client-runtime/state/thread-subagents";
+import { formatResponseReception } from "@t3tools/client-runtime/state/thread-execution";
+import type { OrchestrationV2ResponseReception } from "@t3tools/contracts";
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
 import { GlassContainer, GlassView } from "expo-glass-effect";
 import { type ReactNode, useEffect, useRef, useState } from "react";
@@ -170,7 +172,9 @@ export function FloatingWorkingControl(props: {
         >
           <FloatingStatusLabel
             key={
-              props.status.kind === "working" || props.status.kind === "compacting"
+              props.status.kind === "working" ||
+              props.status.kind === "compacting" ||
+              props.status.kind === "reception"
                 ? props.status.kind
                 : `${props.status.kind}:${props.status.label}`
             }
@@ -361,6 +365,15 @@ function FloatingStatusLabel(props: {
   if (props.status.kind === "compacting") {
     return <CompactingLabel key="compacting" onLayout={props.onLayout} />;
   }
+  if (props.status.kind === "reception") {
+    return (
+      <StatusLabelRow onLayout={props.onLayout}>
+        <SystemText className="text-xs text-foreground-muted" numberOfLines={1}>
+          {formatResponseReception(props.status.responseReception, 0)}
+        </SystemText>
+      </StatusLabelRow>
+    );
+  }
   if (props.status.kind === "connection") {
     return (
       <StatusLabelRow
@@ -434,7 +447,12 @@ function FloatingStatusLabel(props: {
     );
   }
   return (
-    <WorkingDuration key="working" startedAt={props.status.startedAt} onLayout={props.onLayout} />
+    <WorkingDuration
+      key="working"
+      startedAt={props.status.startedAt}
+      responseReception={props.status.responseReception ?? null}
+      onLayout={props.onLayout}
+    />
   );
 }
 
@@ -475,29 +493,40 @@ function StatusLabelRow(props: {
 
 function WorkingDuration(props: {
   readonly startedAt: string;
+  readonly responseReception: OrchestrationV2ResponseReception | null;
   readonly onLayout: (event: LayoutChangeEvent) => void;
 }) {
   return (
     <StatusLabelRow onLayout={props.onLayout}>
-      <WorkingTimer startedAt={props.startedAt} />
+      <WorkingTimer startedAt={props.startedAt} responseReception={props.responseReception} />
     </StatusLabelRow>
   );
 }
 
-export function WorkingTimer(props: { readonly startedAt: string }) {
+export function WorkingTimer(props: {
+  readonly startedAt: string;
+  readonly responseReception?: OrchestrationV2ResponseReception | null;
+}) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     const intervalId = setInterval(() => setNowMs(Date.now()), 1_000);
     return () => clearInterval(intervalId);
   }, []);
   return (
-    <SystemText
-      className="shrink text-xs text-foreground"
-      numberOfLines={1}
-      style={{ fontVariant: ["tabular-nums"], fontWeight: "500" }}
-    >
-      Working {formatWorkingDuration(props.startedAt, nowMs)}
-    </SystemText>
+    <View className="shrink">
+      <SystemText
+        className="shrink text-xs text-foreground"
+        numberOfLines={1}
+        style={{ fontVariant: ["tabular-nums"], fontWeight: "500" }}
+      >
+        Working {formatWorkingDuration(props.startedAt, nowMs)}
+      </SystemText>
+      {props.responseReception ? (
+        <SystemText className="text-[10px] text-foreground-muted" numberOfLines={1}>
+          {formatResponseReception(props.responseReception, nowMs)}
+        </SystemText>
+      ) : null}
+    </View>
   );
 }
 
