@@ -193,6 +193,136 @@ describe("response reception presentation", () => {
     lastTextReceivedAt: receivedAt,
   };
 
+  it.each(["completed", "interrupted", "failed", "cancelled"] as const)(
+    "retains the final totals and frozen TPS after a %s turn while requests stay queued",
+    (status) => {
+      const finished = { ...active, status, completedAt: now };
+      const first = {
+        ...turn("root-active", 6, receivedAt, 120),
+        status: "completed" as const,
+        responseReception: { ...reception, outputTokens: 120, providerWaitMs: 10000 },
+      };
+      const second = {
+        ...first,
+        id: ProviderTurnId.make("second-iteration"),
+        responseReception: { ...reception, outputTokens: 80, providerWaitMs: 2000 },
+      };
+      const projection = {
+        ...v2Projection,
+        runs: [
+          finished,
+          run("queued", 3, "queued"),
+          { ...run("held", 4, "queued"), queueHeld: true },
+          { ...run("cancelled-before-start", 5, "cancelled"), startedAt: null },
+        ],
+        providerTurns: [first, second, turn("old", 99999), turn("child", 99999)],
+      };
+      const final = deriveResponseReception(projection)!;
+      expect(final).toMatchObject({
+        outputTokens: 200,
+        providerWaitMs: 12000,
+        providerWaitStartedAt: null,
+      });
+      expect(formatResponseReception(final, Date.parse(receivedAt) + 1000)).toBe(
+        "[ ↓ 200 ( 16.7 tps) ]",
+      );
+      expect(formatResponseReception(final, Date.parse(receivedAt) + 60000)).toBe(
+        "[ ↓ 200 ( 16.7 tps) ]",
+      );
+      expect(
+        deriveResponseReception({
+          ...projection,
+          providerTurns: [
+            { ...first, responseReception: { ...first.responseReception, outputTokens: 150 } },
+            second,
+          ],
+        })?.outputTokens,
+      ).toBe(230);
+    },
+  );
+
+  it.each(["preparing", "starting", "running"] as const)(
+    "clears the previous turn when the next turn is %s, even before it reports usage",
+    (status) => {
+      const next = { ...run("next", 3, status), rootNodeId: NodeId.make("next-root") };
+      const oldTurn = turn("root-active", 12, receivedAt, 1500);
+      const projection = {
+        ...v2Projection,
+        runs: [{ ...active, status: "completed" as const }, next],
+        providerTurns: [oldTurn],
+      };
+      expect(deriveResponseReception(projection)).toBeNull();
+      expect(
+        deriveResponseReception({
+          ...projection,
+          providerTurns: [oldTurn, turn("next-root", 0, null, 0)],
+        })?.outputTokens,
+      ).toBe(0);
+      expect(
+        deriveResponseReception({
+          ...projection,
+          providerTurns: [oldTurn, turn("next-root", 3, receivedAt, 5)],
+        })?.outputTokens,
+      ).toBe(5);
+      expect(
+        deriveResponseReception({
+          ...projection,
+          runs: [projection.runs[0]!, { ...next, status: "completed" as const }],
+        }),
+      ).toBeNull();
+    },
+  );
+
+  it("retains a provider-native subagent's final reception until its next runless root starts", () => {
+    const root: OrchestrationV2ExecutionNode = {
+      id: NodeId.make("child-root"),
+      threadId: v2Projection.thread.id,
+      runId: null,
+      parentNodeId: null,
+      rootNodeId: NodeId.make("child-root"),
+      kind: "root_turn",
+      status: "completed",
+      countsForRun: false,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      runtimeRequestId: null,
+      checkpointScopeId: null,
+      startedAt: now,
+      completedAt: now,
+    };
+    const projection = {
+      ...v2Projection,
+      thread: {
+        ...v2Projection.thread,
+        creationSource: "provider" as const,
+        lineage: {
+          parentThreadId: ThreadId.make("parent"),
+          relationshipToParent: "subagent" as const,
+          rootThreadId: ThreadId.make("parent"),
+        },
+      },
+      nodes: [root],
+      providerTurns: [turn("child-root", 12, receivedAt, 100)],
+    };
+    expect(deriveResponseReception(projection)?.outputTokens).toBe(100);
+    expect(
+      deriveResponseReception({
+        ...projection,
+        nodes: [
+          root,
+          {
+            ...root,
+            id: NodeId.make("next-root"),
+            rootNodeId: NodeId.make("next-root"),
+            status: "running",
+            completedAt: null,
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
+
   it.each([
     [{ ...reception }, "[ ↓ 1.5k ( 23.4 tps) ]"],
     [{ ...reception, outputTokens: null }, "[ ↓ — ( — tps) ]"],

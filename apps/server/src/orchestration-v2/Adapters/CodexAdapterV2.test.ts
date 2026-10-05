@@ -2598,6 +2598,110 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect.each(["preserved", "reset"] as const)(
+    "keeps response reception across mid-turn Codex compaction with %s usage counters",
+    (counters) =>
+      Effect.gen(function* () {
+        const nativeThreadId = `reception-compaction-${counters}`;
+        const nativeTurnId = "reception-compaction-turn";
+        const notify = (method: string, params: Record<string, unknown>) => ({
+          type: "emit_inbound" as const,
+          label: method,
+          frame: { method, params: { threadId: nativeThreadId, turnId: nativeTurnId, ...params } },
+        });
+        const breakdown = (inputTokens: number, outputTokens: number) => ({
+          totalTokens: inputTokens + outputTokens,
+          inputTokens,
+          cachedInputTokens: 0,
+          outputTokens,
+          reasoningOutputTokens: 0,
+        });
+        const report = (total: ReturnType<typeof breakdown>, last: ReturnType<typeof breakdown>) =>
+          notify("thread/tokenUsage/updated", {
+            tokenUsage: { total, last, modelContextWindow: 200_000 },
+          });
+        const message = (id: string, text: string) => {
+          const item = { type: "agentMessage", id, text, phase: "commentary" };
+          return [
+            notify("item/started", { item: { ...item, text: "" }, startedAtMs: 1782622440500 }),
+            notify("item/agentMessage/delta", { itemId: id, delta: text }),
+            notify("item/completed", { item }),
+            notify("item/completed", { item }),
+          ];
+        };
+        const before = report(breakdown(100, 20), breakdown(100, 20));
+        const compactedTotal = counters === "reset" ? breakdown(50, 5) : breakdown(150, 25);
+        const after = report(
+          counters === "reset" ? breakdown(70, 8) : breakdown(170, 28),
+          breakdown(20, 3),
+        );
+        const item = { type: "contextCompaction", id: "compact-reception" };
+        const transcript = makeCodexReplayTranscript({
+          scenario: nativeThreadId,
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue working." }),
+            ...message("before-compaction", "before"),
+            before,
+            before,
+            notify("item/started", { item, startedAtMs: 1782622441000 }),
+            report(compactedTotal, breakdown(50, 5)),
+            // Context recomputation changes `last` without adding billable usage.
+            report(compactedTotal, { ...breakdown(0, 0), totalTokens: 30 }),
+            notify("item/completed", { item }),
+            ...message("after-compaction", "new"),
+            after,
+            after,
+            {
+              type: "emit_inbound",
+              label: "turn/completed",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(transcript);
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make(nativeThreadId),
+            text: "Continue working.",
+          }),
+        );
+        yield* harness.firstTerminal;
+        const reports = harness.events.flatMap((event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.tokenUsage !== undefined
+            ? [event.providerTurn]
+            : [],
+        );
+        assert.deepEqual(
+          reports.map((turn) => turn.responseReception?.outputTokens),
+          [20, 20, 25, 25, 28, 28],
+        );
+        assert.equal(reports[3]?.tokenUsage?.usedTokens, 30);
+        const compactions = harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "compaction"
+            ? [event.turnItem.status]
+            : [],
+        );
+        assert.deepEqual(compactions, ["running", "completed"]);
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final reception");
+        assert.include(final.providerTurn.responseReception, {
+          receivedTextBytes: 9,
+          outputTokens: 28,
+          providerWaitStartedAt: null,
+        });
+        assert.equal(final.providerTurn.turnTokenUsage?.outputTokens, 28);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
   it.effect("keeps an asynchronous Codex question actionable after the turn completes", () =>
     Effect.scoped(
       Effect.gen(function* () {

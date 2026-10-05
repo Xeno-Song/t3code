@@ -2577,6 +2577,121 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
+  it.effect(
+    "keeps response reception and provider wait time across mid-turn Claude compaction",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const startedAt = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: startedAt,
+            attemptId: RunAttemptId.make("reception-compaction"),
+            text: "Continue working.",
+            attachments: [],
+          }),
+        );
+        const messageFrames = (id: string, text: string, outputTokens: number) => {
+          const stream = (event: unknown) =>
+            claudeSdkFrame({
+              type: "stream_event",
+              event,
+              parent_tool_use_id: null,
+              session_id: WAKE_NATIVE_SESSION,
+              uuid: `stream-${id}`,
+            });
+          const snapshot = claudeSdkFrame({
+            type: "assistant",
+            uuid: `snapshot-${id}`,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id,
+              model: "claude-sonnet-4-6",
+              content: [{ type: "text", text }],
+              usage: { input_tokens: 100, output_tokens: outputTokens },
+            },
+          });
+          return [
+            stream({ type: "message_start", message: { id, usage: { output_tokens: 0 } } }),
+            stream({
+              type: "content_block_start",
+              index: 0,
+              content_block: { type: "text", text: "" },
+            }),
+            stream({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }),
+            stream({ type: "content_block_stop", index: 0 }),
+            stream({
+              type: "message_delta",
+              delta: { stop_reason: "end_turn" },
+              usage: { output_tokens: outputTokens },
+            }),
+            snapshot,
+            snapshot,
+          ];
+        };
+        yield* TestClock.adjust("3 seconds");
+        const firstTextReceivedAt = DateTime.formatIso(yield* DateTime.now);
+        for (const frame of messageFrames("before-compaction", "before", 20)) {
+          yield* harness.offerAndWait(frame);
+        }
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "compact_boundary",
+            compact_metadata: { trigger: "auto", pre_tokens: 1500, post_tokens: 200 },
+            uuid: "reception-compact-boundary",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        yield* TestClock.adjust("5 seconds");
+        const lastTextReceivedAt = DateTime.formatIso(yield* DateTime.now);
+        for (const frame of messageFrames("after-compaction", "new", 3)) {
+          yield* harness.offerAndWait(frame);
+        }
+        yield* TestClock.adjust("2 seconds");
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            ...makeResultFrame({ uuid: "reception-compaction-result", result: "new", numTurns: 2 }),
+            usage: { input_tokens: 200, output_tokens: 23 },
+          }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const reports = harness.events.flatMap((event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.tokenUsage !== undefined &&
+          event.providerTurn.responseReception !== undefined
+            ? [event.providerTurn.responseReception.outputTokens]
+            : [],
+        );
+        assert.deepEqual(reports, [20, 20, 23, 23]);
+        const compaction = harness.events.find(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
+        );
+        assert.isDefined(compaction);
+        const watermark = harness.events.find(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.tokenUsage?.usedTokens === 200,
+        );
+        assert.isDefined(watermark);
+        const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        if (final?.type !== "provider_turn.updated") throw new Error("Missing final reception");
+        assert.include(final.providerTurn.responseReception, {
+          receivedTextBytes: 9,
+          outputTokens: 23,
+          providerWaitMs: 10000,
+          providerWaitStartedAt: null,
+          firstTextReceivedAt,
+          lastTextReceivedAt,
+        });
+        assert.equal(final.providerTurn.turnTokenUsage?.outputTokens, 23);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
   it.effect.each(["completed", "interrupted", "failed"] as const)(
     "counts root text and thinking blocks once when %s and resets the next turn",
     (status) =>
